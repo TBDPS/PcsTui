@@ -21,7 +21,7 @@ use crate::transfer::upload::{UploadRequest, ensure_remote_dir, plan_upload, upl
 #[command(
     name = "pcstui",
     version,
-    about = "原生 Rust 百度网盘 TUI / CLI（无需 BaiduPCS-Go 二进制）",
+    about = "原生 Rust 百度网盘双栏 TUI 与 CLI 客户端",
     long_about = None
 )]
 pub struct Cli {

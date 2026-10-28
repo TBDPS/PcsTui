@@ -3,9 +3,7 @@
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
 [![Rust](https://img.shields.io/badge/rust-1.85%2B-orange.svg)](Cargo.toml)
 
-原生 Rust 实现的现代化百度网盘双栏终端客户端（TUI），提供图形化双栏文件管理，并保留轻量级 CLI 作为脚本与自动化入口。
-
-本项目完全独立运行，直接调用百度网盘 Web / PCS 原生 HTTP API，**无需安装任何外部二进制运行时或第三方语言环境**。
+原生 Rust 实现的现代化百度网盘双栏终端客户端（TUI），提供高效的图形化双栏文件管理体验，并保留轻量级 CLI 作为脚本与自动化入口。客户端直接基于百度网盘原生 HTTP API 构建。
 
 ---
 

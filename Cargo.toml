@@ -2,7 +2,7 @@
 name = "pcstui"
 version = "0.1.0"
 edition = "2024"
-description = "Native Rust Baidu Netdisk TUI — no external Go binary required"
+description = "Native Rust Baidu Netdisk dual-pane TUI and CLI client"
 license = "Apache-2.0"
 rust-version = "1.85"
 
