@@ -259,7 +259,7 @@ fn draw_remote(frame: &mut Frame, area: Rect, app: &mut App) {
         .filter_map(|(position, index)| app.remote.entries.get(*index).map(|item| (position, item)))
         .map(|(position, item)| {
             let absolute = item.absolute_path(&app.remote.cwd);
-            let marked = app.marked_remote.contains(&absolute);
+            let marked = app.marked_remote.contains_key(&absolute);
             let name = if search_mode {
                 absolute.clone()
             } else {
@@ -418,27 +418,18 @@ fn draw_status(frame: &mut Frame, area: Rect, app: &App) {
         chunks[1],
     );
 
+    let hint = match app.focus {
+        Focus::Local => "Enter 进入/上传 · u 上传 · x 删除 · / 过滤 · h 隐藏文件",
+        Focus::Remote => {
+            "Enter 进入/下载 · d 下载 · x 删除 · m/c 移动/复制 · R 重命名 · / 过滤 · f 搜索"
+        }
+        Focus::Transfers => "Enter/K 取消选中任务",
+    };
     let line2 = Line::from(vec![
         Span::styled(" Tab ", Style::default().fg(Color::Black).bg(ACCENT_DIM)),
         Span::raw("切换  "),
-        Span::styled("1-99", Style::default().fg(ACCENT)),
-        Span::raw(" 跳转  "),
-        Span::styled("Enter", Style::default().fg(ACCENT)),
-        Span::raw(" 进入/传输  "),
-        Span::styled("d", Style::default().fg(ACCENT)),
-        Span::raw(" 下载  "),
-        Span::styled("u", Style::default().fg(ACCENT)),
-        Span::raw(" 上传  "),
-        Span::styled("x", Style::default().fg(ACCENT)),
-        Span::raw(" 删除  "),
-        Span::styled("m/c", Style::default().fg(ACCENT)),
-        Span::raw(" 移动/复制  "),
-        Span::styled("R", Style::default().fg(ACCENT)),
-        Span::raw(" 重命名  "),
-        Span::styled("/", Style::default().fg(ACCENT)),
-        Span::raw(" 过滤  "),
-        Span::styled("f", Style::default().fg(ACCENT)),
-        Span::raw(" 搜索  "),
+        Span::styled(hint, Style::default().fg(MUTED)),
+        Span::raw("  "),
         Span::styled("p", Style::default().fg(ACCENT)),
         Span::raw(" 传输  "),
         Span::styled("?", Style::default().fg(ACCENT)),
@@ -470,29 +461,51 @@ fn draw_help(frame: &mut Frame, area: Rect) {
         ]),
         Line::from(vec![key("Backspace / ←"), text("  返回上级目录")]),
         Line::from(vec![key("Space"), text("  标记 / 取消标记（批量操作）")]),
-        Line::from(vec![key("d"), text("  下载远程选中项到本地当前目录")]),
-        Line::from(vec![key("u"), text("  上传本地选中项到远程当前目录")]),
-        Line::from(vec![key("x"), text("  删除选中项（需要确认）")]),
-        Line::from(vec![key("m / c"), text("  移动 / 复制到指定远程目录")]),
-        Line::from(vec![key("R"), text("  重命名远程选中项")]),
-        Line::from(vec![key("n"), text("  新建远程目录")]),
-        Line::from(vec![key("g"), text("  跳转到远程绝对路径")]),
+        Line::from(vec![key("d"), text("  下载远程选中项（仅远程面板）")]),
+        Line::from(vec![key("u"), text("  上传本地选中项（仅本地面板）")]),
+        Line::from(vec![
+            key("x"),
+            text("  删除本地/远程选中项（需确认，默认取消）"),
+        ]),
+        Line::from(vec![
+            key("m / c"),
+            text("  移动 / 复制远程选中项（仅远程面板）"),
+        ]),
+        Line::from(vec![key("R"), text("  重命名远程选中项（仅远程面板）")]),
+        Line::from(vec![key("n"), text("  新建远程目录（仅远程面板）")]),
+        Line::from(vec![key("g"), text("  跳转到远程绝对路径（仅远程面板）")]),
         Line::from(vec![
             key("Tab"),
             text("  在跳转/移动/复制/新建/重命名输入框中补全远程路径"),
         ]),
-        Line::from(vec![key("/"), text("  过滤当前面板")]),
-        Line::from(vec![key("f"), text("  搜索网盘（当前目录递归）")]),
+        Line::from(vec![key("/"), text("  过滤当前面板（本地/远程）")]),
+        Line::from(vec![key("f"), text("  搜索网盘（仅远程面板）")]),
         Line::from(vec![key("s"), text("  远程排序；本地切换隐藏文件")]),
-        Line::from(vec![key("h"), text("  本地显示 / 隐藏点文件")]),
-        Line::from(vec![key("r"), text("  刷新当前面板")]),
+        Line::from(vec![
+            key("h"),
+            text("  本地显示 / 隐藏点文件（仅本地面板）"),
+        ]),
+        Line::from(vec![key("r"), text("  刷新当前面板（本地/远程）")]),
         Line::from(vec![key("p"), text("  显示 / 隐藏传输队列")]),
-        Line::from(vec![key("K"), text("  取消传输面板中选中的任务")]),
-        Line::from(vec![key("y"), text("  在本地当前目录启动 Yazi")]),
-        Line::from(vec![key("o"), text("  用 xdg-open 打开本地文件")]),
+        Line::from(vec![
+            key("K"),
+            text("  取消传输面板中选中的任务（仅传输面板）"),
+        ]),
+        Line::from(vec![
+            key("y"),
+            text("  在本地当前目录启动 Yazi（仅本地面板）"),
+        ]),
+        Line::from(vec![
+            key("o"),
+            text("  用 xdg-open 打开本地文件（仅本地面板）"),
+        ]),
         Line::from(vec![key("?"), text("  关闭帮助")]),
         Line::from(vec![key("q"), text("  退出（有活动传输时确认）")]),
         Line::from(""),
+        Line::from(Span::styled(
+            "危险操作会先按 fs_id 重新确认远程项目身份；项目已变化时整批中止。",
+            Style::default().fg(MUTED),
+        )),
         Line::from(Span::styled(
             "提示：多连接下载断点保存在 .<文件名>.pcstui.part 与 .state.json；上传断点保存在 config/upload-state/。",
             Style::default().fg(MUTED),
@@ -574,13 +587,13 @@ fn draw_confirm(frame: &mut Frame, area: Rect, title: &str, message: &str) {
         )),
         Line::from(""),
         Line::from(vec![
-            Span::styled(" y / Enter ", Style::default().fg(Color::Black).bg(ERR)),
+            Span::styled(" y ", Style::default().fg(Color::Black).bg(ERR)),
             Span::raw(" 确认    "),
             Span::styled(
-                " n / Esc ",
+                " Enter / n / Esc ",
                 Style::default().fg(Color::Black).bg(ACCENT_DIM),
             ),
-            Span::raw(" 取消"),
+            Span::raw(" 取消（默认）"),
         ]),
     ];
     frame.render_widget(

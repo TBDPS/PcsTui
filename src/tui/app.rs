@@ -251,13 +251,13 @@ impl RemotePane {
         self.entries.get(index)
     }
 
-    pub fn marked_or_current(&self, marked: &HashSet<String>) -> Vec<RemoteItem> {
+    pub fn marked_or_current(&self, marked: &HashMap<String, RemoteRef>) -> Vec<RemoteItem> {
         if marked.is_empty() {
             return self.current().cloned().into_iter().collect();
         }
         self.entries
             .iter()
-            .filter(|item| marked.contains(&item.absolute_path(&self.cwd)))
+            .filter(|item| marked.contains_key(&item.absolute_path(&self.cwd)))
             .cloned()
             .collect()
     }
@@ -283,6 +283,60 @@ impl RemotePane {
     }
 }
 
+/// Stable identity for a remote item while it is selected for a destructive
+/// action. Paths alone are not identity: the server may reuse a path for a
+/// different file between the listing and the confirmation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RemoteRef {
+    pub fs_id: u64,
+    pub path: String,
+    pub name: String,
+    pub is_dir: bool,
+}
+
+impl RemoteRef {
+    pub fn from_item(item: &RemoteItem, cwd: &str) -> Self {
+        Self {
+            fs_id: item.fs_id,
+            path: item.absolute_path(cwd),
+            name: item.name.clone(),
+            is_dir: item.is_dir,
+        }
+    }
+}
+
+fn remote_ref_matches(reference: &RemoteRef, current: &RemoteItem) -> bool {
+    reference.fs_id != 0
+        && current.fs_id == reference.fs_id
+        && current.is_dir == reference.is_dir
+        && current.name == reference.name
+}
+
+/// Re-check every selected item immediately before a destructive remote call.
+/// If any item changed or vanished, the whole batch is aborted. Partial
+/// deletion based on stale paths is worse than making the user refresh.
+async fn verify_remote_refs(client: &BaiduClient, refs: &[RemoteRef]) -> Result<(), String> {
+    for reference in refs {
+        if reference.fs_id == 0 {
+            return Err(format!(
+                "无法确认远程项目身份（缺少 fs_id）：{}；请刷新后重试",
+                reference.path
+            ));
+        }
+        let current = client
+            .stat(&reference.path)
+            .await
+            .map_err(|err| format!("无法确认远程项目 {}: {err}", reference.path))?;
+        if !remote_ref_matches(reference, &current) {
+            return Err(format!(
+                "远程项目已变化：{}（原 fs_id {}，当前 fs_id {}）",
+                reference.path, reference.fs_id, current.fs_id
+            ));
+        }
+    }
+    Ok(())
+}
+
 #[derive(Debug, Clone)]
 pub enum InputKind {
     FilterLocal,
@@ -290,9 +344,9 @@ pub enum InputKind {
     Search,
     Mkdir,
     Goto,
-    Rename { from: String },
-    MoveDest { sources: Vec<String> },
-    CopyDest { sources: Vec<String> },
+    Rename { from: RemoteRef },
+    MoveDest { sources: Vec<RemoteRef> },
+    CopyDest { sources: Vec<RemoteRef> },
 }
 
 pub struct InputState {
@@ -425,7 +479,7 @@ fn char_to_byte(value: &str, char_index: usize) -> usize {
 
 #[derive(Debug, Clone)]
 pub enum ConfirmAction {
-    DeleteRemote(Vec<String>),
+    DeleteRemote(Vec<RemoteRef>),
     DeleteLocal(Vec<PathBuf>),
     Quit,
 }
@@ -471,7 +525,7 @@ pub struct App {
     pub confirm: Option<ConfirmState>,
     pub help: bool,
     pub marked_local: HashSet<PathBuf>,
-    pub marked_remote: HashSet<String>,
+    pub marked_remote: HashMap<String, RemoteRef>,
     pub should_quit: bool,
     pub request_yazi: bool,
     pub dirty_config: bool,
@@ -524,7 +578,7 @@ impl App {
             confirm: None,
             help: false,
             marked_local: HashSet::new(),
-            marked_remote: HashSet::new(),
+            marked_remote: HashMap::new(),
             should_quit: false,
             request_yazi: false,
             dirty_config: false,
@@ -958,56 +1012,164 @@ impl App {
             KeyCode::End => self.select_last(),
             KeyCode::Enter | KeyCode::Right => self.enter(),
             KeyCode::Backspace | KeyCode::Left => self.go_parent(),
-            KeyCode::Esc => self.clear_search(),
-            KeyCode::Char('r') => self.refresh_focused(),
-            KeyCode::Char('R') => self.start_rename(),
-            KeyCode::Char('n') => self.start_mkdir(),
-            KeyCode::Char('g') => self.start_goto(),
-            KeyCode::Char('f') => self.start_search(),
-            KeyCode::Char('/') => self.start_filter(),
-            KeyCode::Char('s') => {
-                if matches!(self.focus, Focus::Remote | Focus::Transfers) {
+            KeyCode::Esc => {
+                if self.focus != Focus::Transfers {
+                    self.clear_search();
+                }
+            }
+            KeyCode::Char('r') => {
+                if self.focus != Focus::Transfers {
+                    self.refresh_focused();
+                }
+            }
+            KeyCode::Char('R') => {
+                if self.focus == Focus::Remote {
+                    self.start_rename();
+                } else {
+                    self.wrong_focus("重命名", "远程");
+                }
+            }
+            KeyCode::Char('n') => {
+                if self.focus == Focus::Remote {
+                    self.start_mkdir();
+                } else {
+                    self.wrong_focus("新建远程目录", "远程");
+                }
+            }
+            KeyCode::Char('g') => {
+                if self.focus == Focus::Remote {
+                    self.start_goto();
+                } else {
+                    self.wrong_focus("跳转远程目录", "远程");
+                }
+            }
+            KeyCode::Char('f') => {
+                if self.focus == Focus::Remote {
+                    self.start_search();
+                } else {
+                    self.wrong_focus("搜索网盘", "远程");
+                }
+            }
+            KeyCode::Char('/') => {
+                if self.focus == Focus::Transfers {
+                    self.wrong_focus("过滤", "本地或远程");
+                } else {
+                    self.start_filter();
+                }
+            }
+            KeyCode::Char('s') => match self.focus {
+                Focus::Remote => {
                     self.remote.sort = self.remote.sort.next();
                     self.remote.sort_entries();
                     self.set_status(format!("远程排序: {}", self.remote.sort.label()), false);
-                } else {
+                }
+                Focus::Local => {
                     self.local.show_hidden = !self.local.show_hidden;
                     self.local.clamp_selection();
                 }
-            }
+                Focus::Transfers => self.wrong_focus("排序", "远程"),
+            },
             KeyCode::Char('h') => {
-                self.local.show_hidden = !self.local.show_hidden;
-                self.local.clamp_selection();
-                self.set_status(
-                    if self.local.show_hidden {
-                        "显示隐藏文件"
-                    } else {
-                        "隐藏隐藏文件"
-                    },
-                    false,
-                );
+                if self.focus == Focus::Local {
+                    self.local.show_hidden = !self.local.show_hidden;
+                    self.local.clamp_selection();
+                    self.set_status(
+                        if self.local.show_hidden {
+                            "显示隐藏文件"
+                        } else {
+                            "隐藏隐藏文件"
+                        },
+                        false,
+                    );
+                } else {
+                    self.wrong_focus("隐藏文件开关", "本地");
+                }
             }
-            KeyCode::Char(' ') => self.toggle_mark(),
-            KeyCode::Char('d') => self.download_selected(),
-            KeyCode::Char('u') => self.upload_selected(),
-            KeyCode::Char('x') => self.delete_selected(),
-            KeyCode::Char('m') => self.start_move(),
-            KeyCode::Char('c') => self.start_copy(),
-            KeyCode::Char('K') => self.cancel_selected_transfer(),
-            KeyCode::Char('y') => self.request_yazi = true,
-            KeyCode::Char('o') => self.open_local(),
+            KeyCode::Char(' ') => {
+                if self.focus == Focus::Transfers {
+                    self.wrong_focus("标记", "本地或远程");
+                } else {
+                    self.toggle_mark();
+                }
+            }
+            KeyCode::Char('d') => {
+                if self.focus == Focus::Remote {
+                    self.download_selected();
+                } else {
+                    self.wrong_focus("下载", "远程");
+                }
+            }
+            KeyCode::Char('u') => {
+                if self.focus == Focus::Local {
+                    self.upload_selected();
+                } else {
+                    self.wrong_focus("上传", "本地");
+                }
+            }
+            KeyCode::Char('x') => {
+                if self.focus == Focus::Transfers {
+                    self.wrong_focus("删除", "本地或远程");
+                } else {
+                    self.delete_selected();
+                }
+            }
+            KeyCode::Char('m') => {
+                if self.focus == Focus::Remote {
+                    self.start_move();
+                } else {
+                    self.wrong_focus("移动", "远程");
+                }
+            }
+            KeyCode::Char('c') => {
+                if self.focus == Focus::Remote {
+                    self.start_copy();
+                } else {
+                    self.wrong_focus("复制", "远程");
+                }
+            }
+            KeyCode::Char('K') => {
+                if self.focus == Focus::Transfers {
+                    self.cancel_selected_transfer();
+                } else {
+                    self.wrong_focus("取消传输", "传输");
+                }
+            }
+            KeyCode::Char('y') => {
+                if self.focus == Focus::Local {
+                    self.request_yazi = true;
+                } else {
+                    self.wrong_focus("启动 Yazi", "本地");
+                }
+            }
+            KeyCode::Char('o') => {
+                if self.focus == Focus::Local {
+                    self.open_local();
+                } else {
+                    self.wrong_focus("打开本地文件", "本地");
+                }
+            }
             _ => {}
         }
     }
 
+    fn wrong_focus(&mut self, action: &str, expected: &str) {
+        self.set_status(format!("{action}仅在{expected}面板可用"), true);
+    }
+
     fn handle_confirm_key(&mut self, key: KeyEvent) {
         match key.code {
-            KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => {
+            KeyCode::Char('y') | KeyCode::Char('Y') => {
                 if let Some(confirm) = self.confirm.take() {
                     self.execute_confirm(confirm.action);
                 }
             }
-            KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc | KeyCode::Char('q') => {
+            // Enter is deliberately a cancel key. A stray Enter after opening
+            // a destructive confirmation must never delete anything.
+            KeyCode::Enter
+            | KeyCode::Char('n')
+            | KeyCode::Char('N')
+            | KeyCode::Esc
+            | KeyCode::Char('q') => {
                 self.confirm = None;
                 self.set_status("已取消", false);
             }
@@ -1017,14 +1179,23 @@ impl App {
 
     fn execute_confirm(&mut self, action: ConfirmAction) {
         match action {
-            ConfirmAction::DeleteRemote(paths) => {
+            ConfirmAction::DeleteRemote(refs) => {
                 let client = self.client.clone();
                 let tx = self.tx.clone();
+                let count = refs.len();
                 tokio::spawn(async move {
-                    let result = client.remove(&paths).await;
-                    let (message, error) = match result {
-                        Ok(()) => (format!("已删除 {} 项", paths.len()), false),
-                        Err(err) => (format!("删除失败: {err}"), true),
+                    let (message, error) = match verify_remote_refs(&client, &refs).await {
+                        Ok(()) => {
+                            let paths = refs
+                                .iter()
+                                .map(|reference| reference.path.clone())
+                                .collect::<Vec<_>>();
+                            match client.remove(&paths).await {
+                                Ok(()) => (format!("已删除 {count} 项"), false),
+                                Err(err) => (format!("删除失败: {err}"), true),
+                            }
+                        }
+                        Err(err) => (format!("删除已取消: {err}"), true),
                     };
                     let _ = tx.send(AppEvent::TaskDone {
                         message,
@@ -1318,16 +1489,24 @@ impl App {
                 let to = if value.starts_with('/') {
                     normalize_remote(&value)
                 } else {
-                    remote_join(&remote_parent(&from), &value)
+                    remote_join(&remote_parent(&from.path), &value)
                 };
+                if to == from.path {
+                    self.set_status("新名称与原名称相同", true);
+                    return;
+                }
                 let client = self.client.clone();
                 let tx = self.tx.clone();
+                let reference = from;
                 tokio::spawn(async move {
-                    let result = client.rename(&from, &to).await;
-                    let (message, error) = match result {
-                        Ok(()) => (format!("已重命名: {from} → {to}"), false),
-                        Err(err) => (format!("重命名失败: {err}"), true),
-                    };
+                    let (message, error) =
+                        match verify_remote_refs(&client, std::slice::from_ref(&reference)).await {
+                            Ok(()) => match client.rename(&reference.path, &to).await {
+                                Ok(()) => (format!("已重命名: {} → {to}", reference.path), false),
+                                Err(err) => (format!("重命名失败: {err}"), true),
+                            },
+                            Err(err) => (format!("重命名已取消: {err}"), true),
+                        };
                     let _ = tx.send(AppEvent::TaskDone {
                         message,
                         error,
@@ -1342,11 +1521,20 @@ impl App {
                 let dest = normalize_remote(&value);
                 let client = self.client.clone();
                 let tx = self.tx.clone();
+                let count = sources.len();
                 tokio::spawn(async move {
-                    let result = client.move_paths(&sources, &dest).await;
-                    let (message, error) = match result {
-                        Ok(()) => (format!("已移动 {} 项到 {dest}", sources.len()), false),
-                        Err(err) => (format!("移动失败: {err}"), true),
+                    let (message, error) = match verify_remote_refs(&client, &sources).await {
+                        Ok(()) => {
+                            let paths = sources
+                                .iter()
+                                .map(|reference| reference.path.clone())
+                                .collect::<Vec<_>>();
+                            match client.move_paths(&paths, &dest).await {
+                                Ok(()) => (format!("已移动 {count} 项到 {dest}"), false),
+                                Err(err) => (format!("移动失败: {err}"), true),
+                            }
+                        }
+                        Err(err) => (format!("移动已取消: {err}"), true),
                     };
                     let _ = tx.send(AppEvent::TaskDone {
                         message,
@@ -1363,11 +1551,20 @@ impl App {
                 let dest = normalize_remote(&value);
                 let client = self.client.clone();
                 let tx = self.tx.clone();
+                let count = sources.len();
                 tokio::spawn(async move {
-                    let result = client.copy_paths(&sources, &dest).await;
-                    let (message, error) = match result {
-                        Ok(()) => (format!("已复制 {} 项到 {dest}", sources.len()), false),
-                        Err(err) => (format!("复制失败: {err}"), true),
+                    let (message, error) = match verify_remote_refs(&client, &sources).await {
+                        Ok(()) => {
+                            let paths = sources
+                                .iter()
+                                .map(|reference| reference.path.clone())
+                                .collect::<Vec<_>>();
+                            match client.copy_paths(&paths, &dest).await {
+                                Ok(()) => (format!("已复制 {count} 项到 {dest}"), false),
+                                Err(err) => (format!("复制失败: {err}"), true),
+                            }
+                        }
+                        Err(err) => (format!("复制已取消: {err}"), true),
                     };
                     let _ = tx.send(AppEvent::TaskDone {
                         message,
@@ -1438,7 +1635,7 @@ impl App {
             "新名称（可输入完整路径）",
             item.name.clone(),
             InputKind::Rename {
-                from: item.absolute_path(&self.remote.cwd),
+                from: RemoteRef::from_item(item, &self.remote.cwd),
             },
         ));
     }
@@ -1448,7 +1645,7 @@ impl App {
             .remote
             .marked_or_current(&self.marked_remote)
             .iter()
-            .map(|item| item.absolute_path(&self.remote.cwd))
+            .map(|item| RemoteRef::from_item(item, &self.remote.cwd))
             .collect::<Vec<_>>();
         if sources.is_empty() {
             self.set_status("没有选中的远程项目", true);
@@ -1467,7 +1664,7 @@ impl App {
             .remote
             .marked_or_current(&self.marked_remote)
             .iter()
-            .map(|item| item.absolute_path(&self.remote.cwd))
+            .map(|item| RemoteRef::from_item(item, &self.remote.cwd))
             .collect::<Vec<_>>();
         if sources.is_empty() {
             self.set_status("没有选中的远程项目", true);
@@ -1536,22 +1733,26 @@ impl App {
                     action: ConfirmAction::DeleteLocal(paths),
                 });
             }
-            Focus::Remote | Focus::Transfers => {
+            Focus::Remote => {
                 let items = self.remote.marked_or_current(&self.marked_remote);
                 if items.is_empty() {
                     self.set_status("没有选中的远程项目", true);
                     return;
                 }
-                let paths = items
+                let refs = items
                     .iter()
-                    .map(|item| item.absolute_path(&self.remote.cwd))
+                    .map(|item| RemoteRef::from_item(item, &self.remote.cwd))
                     .collect::<Vec<_>>();
                 self.confirm = Some(ConfirmState {
                     title: "删除远程文件".to_string(),
-                    message: format!("确定删除 {} 个远程项目？此操作不可恢复。", paths.len()),
-                    action: ConfirmAction::DeleteRemote(paths),
+                    message: format!(
+                        "确定删除 {} 个远程项目？此操作不可恢复。默认取消。",
+                        refs.len()
+                    ),
+                    action: ConfirmAction::DeleteRemote(refs),
                 });
             }
+            Focus::Transfers => self.wrong_focus("删除", "本地或远程"),
         }
     }
 
@@ -1565,14 +1766,16 @@ impl App {
                     }
                 }
             }
-            Focus::Remote | Focus::Transfers => {
+            Focus::Remote => {
                 if let Some(item) = self.remote.current() {
                     let path = item.absolute_path(&self.remote.cwd);
-                    if !self.marked_remote.insert(path.clone()) {
-                        self.marked_remote.remove(&path);
+                    if self.marked_remote.remove(&path).is_none() {
+                        self.marked_remote
+                            .insert(path, RemoteRef::from_item(item, &self.remote.cwd));
                     }
                 }
             }
+            Focus::Transfers => self.wrong_focus("标记", "本地或远程"),
         }
     }
 
@@ -2019,6 +2222,142 @@ pub fn require_path(value: &str) -> Result<&str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::{Account, ConfigFile, Paths};
+
+    fn test_app() -> (App, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = Paths {
+            root: dir.path().to_path_buf(),
+            config_dir: dir.path().join("config"),
+            config_file: dir.path().join("config/pcstui.json"),
+            download_dir: dir.path().join("downloads"),
+            tmp_dir: dir.path().join("tmp"),
+            upload_state_dir: dir.path().join("config/upload-state"),
+            queue_file: dir.path().join("config/queue.json"),
+        };
+        let file = ConfigFile {
+            account: Some(Account {
+                uid: 1,
+                name: "test".to_string(),
+                bduss: "bduss".to_string(),
+                stoken: "stoken".to_string(),
+                baiduid: String::new(),
+                access_token: String::new(),
+            }),
+            ..Default::default()
+        };
+        let config = RuntimeConfig { paths, file };
+        let client = BaiduClient::new(&config).unwrap();
+        let (engine, _transfer_rx) = TransferEngine::new(client.clone(), config.clone());
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = App::new(config, client, engine, tx);
+        // Tests must not depend on the process working directory.
+        app.local.entries.clear();
+        app.remote.entries.clear();
+        (app, dir)
+    }
+
+    fn remote_item() -> RemoteItem {
+        RemoteItem {
+            fs_id: 7,
+            name: "file.txt".to_string(),
+            path: "/docs/file.txt".to_string(),
+            size: 10,
+            is_dir: false,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn remote_ref_captures_and_checks_fs_id() {
+        let item = remote_item();
+        let reference = RemoteRef::from_item(&item, "/");
+        assert_eq!(reference.fs_id, 7);
+        assert_eq!(reference.path, "/docs/file.txt");
+        assert!(remote_ref_matches(&reference, &item));
+
+        let mut changed = item.clone();
+        changed.fs_id = 8;
+        assert!(!remote_ref_matches(&reference, &changed));
+
+        let mut missing_id = item.clone();
+        missing_id.fs_id = 0;
+        assert!(!remote_ref_matches(&reference, &missing_id));
+        let no_id = RemoteRef {
+            fs_id: 0,
+            ..reference
+        };
+        assert!(!remote_ref_matches(&no_id, &missing_id));
+    }
+
+    #[test]
+    fn enter_cancels_destructive_confirmation() {
+        let (mut app, _dir) = test_app();
+        app.confirm = Some(ConfirmState {
+            title: "退出".to_string(),
+            message: "test".to_string(),
+            action: ConfirmAction::Quit,
+        });
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(app.confirm.is_none());
+        assert!(!app.should_quit);
+
+        app.confirm = Some(ConfirmState {
+            title: "退出".to_string(),
+            message: "test".to_string(),
+            action: ConfirmAction::Quit,
+        });
+        app.handle_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE));
+        assert!(app.confirm.is_none());
+        assert!(app.should_quit);
+    }
+
+    #[test]
+    fn remote_actions_are_scoped_to_remote_focus() {
+        let (mut app, _dir) = test_app();
+        app.remote.entries = vec![remote_item()];
+        app.remote.selected = 0;
+
+        app.focus = Focus::Transfers;
+        app.handle_key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE));
+        assert!(app.confirm.is_none());
+
+        app.focus = Focus::Local;
+        app.handle_key(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::NONE));
+        assert!(app.transfers.is_empty());
+        for key in ['m', 'c', 'R', 'n', 'g', 'f'] {
+            app.handle_key(KeyEvent::new(KeyCode::Char(key), KeyModifiers::NONE));
+            assert!(app.input.is_none(), "{key} should not open remote input");
+        }
+
+        app.focus = Focus::Remote;
+        app.handle_key(KeyEvent::new(KeyCode::Char('R'), KeyModifiers::NONE));
+        assert!(matches!(
+            app.input.as_ref().map(|input| &input.kind),
+            Some(InputKind::Rename { from }) if from.fs_id == 7
+        ));
+    }
+
+    #[test]
+    fn marking_remote_items_keeps_identity() {
+        let (mut app, _dir) = test_app();
+        app.focus = Focus::Remote;
+        app.remote.entries = vec![remote_item()];
+        app.remote.selected = 0;
+        app.handle_key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE));
+        let reference = app.marked_remote.get("/docs/file.txt").unwrap();
+        assert_eq!(reference.fs_id, 7);
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE));
+        match app.confirm.as_ref().map(|confirm| &confirm.action) {
+            Some(ConfirmAction::DeleteRemote(refs)) => {
+                assert_eq!(refs.len(), 1);
+                assert_eq!(refs[0].fs_id, 7);
+                assert_eq!(refs[0].path, "/docs/file.txt");
+            }
+            other => panic!("unexpected confirmation: {other:?}"),
+        }
+    }
 
     #[test]
     fn step_clamps() {
@@ -2036,14 +2375,7 @@ mod tests {
 
     #[test]
     fn input_cursor_supports_unicode_editing() {
-        let mut input = InputState::new(
-            "t",
-            "p",
-            "远程文件.txt".to_string(),
-            InputKind::Rename {
-                from: "/远程文件.txt".to_string(),
-            },
-        );
+        let mut input = InputState::new("t", "p", "远程文件.txt".to_string(), InputKind::Goto);
         assert_eq!(input.cursor, 8);
         input.move_left();
         input.backspace();
