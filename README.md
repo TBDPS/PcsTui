@@ -1,345 +1,216 @@
 # pcstui
 
-原生 Rust 百度网盘双栏 TUI，CLI 作为脚本与冒烟测试入口。所有操作直接走百度网盘 HTTP API。
+[![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
+[![Rust](https://img.shields.io/badge/rust-1.85%2B-orange.svg)](Cargo.toml)
 
-- 项目位置：`/home/mat/pansync/pcstui`
-- 可执行文件：`target/release/pcstui`
-- 许可证：Apache-2.0（`NOTICE` 保留协议实现的必要归属）
-- 自包含：源码和可执行文件不含任何账号信息，凭据只保存在可移植的 `config/pcstui.json`
+原生 Rust 实现的现代化百度网盘双栏终端客户端（TUI），提供图形化双栏文件管理，并保留轻量级 CLI 作为脚本与自动化入口。
 
-## 设计目标
+本项目完全独立运行，直接调用百度网盘 Web / PCS 原生 HTTP API，**无需安装任何外部二进制运行时或第三方语言环境**。
 
-- 全部操作直接走百度网盘 HTTP API；
-- 结构化错误处理、持久化传输队列、断点续传和 MD5 校验；
-- 用 `fs_id` 标识远程对象，避免缓存列表与真实网盘状态不一致导致误操作；
-- TUI 为配置与诊断主入口；CLI 保持最小脚本面，不追求功能对等；
-- 换机只需一个文件：复制 `config/pcstui.json`，或在 TUI 里按 `C` 导入明文配置。
+---
 
-实现说明与取舍见：
+## 核心特性
 
-- [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md)
-- [`docs/ACCEPTANCE.md`](docs/ACCEPTANCE.md)
-- [`docs/FEATURE-MATRIX.md`](docs/FEATURE-MATRIX.md)
+- **双栏直观浏览**：本地文件系统与远程网盘同屏双栏对照，导航、标记、批量上传/下载一气呵成。
+- **纯原生高性能**：基于 Rust `tokio` 异步运行时与 `ratatui` 构建，内存占用极小，启动瞬时完成。
+- **可靠的断点续传**：
+  - **下载**：大文件（≥64 MiB）自动启用多连接 Range 闭合区间并发（默认 4 连接，每片 4 MiB），维护分片位图与每片独立 MD5 校验；下载完成后校验权威 `Content-MD5` 并保留远端修改时间。
+  - **上传**：支持分块计算、`precreate` 秒传、分片断点续传（`superfile2`）与分片 MD5 校验，防止上传坏块合并。
+- **持久化任务队列**：传输意图持久化保存在 `config/queue.json` 中，按任务身份强去重；意外退出或重启后自动恢复未完成的任务。
+- **破坏性操作安全防御**：
+  - 远程删除、移动、复制、重命名操作均深度绑定百度网盘不可变对象标识 `fs_id`。
+  - 操作提交前自动向服务端复核远端状态，若项目已被外部修改或删除，整批操作立即主动中止，杜绝列表脏数据导致的误删。
+  - 删除确认默认“取消”，必须显式键入 `y` 确认。
+- **单实例内核互斥锁**：
+  - 依托内核级建议锁（Unix `flock` / Windows `LockFileEx`），严防多个 TUI 实例或并发写命令损坏配置文件与传输状态。
+  - 读写解耦：只读 CLI 指令（`whoami`、`quota`、`ls`、`doctor` 等）完全免锁，可在 TUI 运行的同时自由并发查询。
+  - 进程崩溃时内核自动释放锁，无遗留死锁风险。
+- **自包含与安全配置**：
+  - 零远程遥测、零外部凭据中转，源码与编译产物不包含任何账号硬编码。
+  - 本地配置（`config/pcstui.json`）与待办队列严格采用 `0600` 私有权限，并支持脱敏导出（可安全分享模板）与完整明文导出（配合 `age`/`gpg` 加密）。
+- **灵活的终端适配与跨平台**：
+  - 支持 Linux、macOS 与 Windows。
+  - 支持 90×30 等短屏/窄屏终端自适应（自适应双栏快捷键帮助、配置面板固定按键行与平滑滚动）。
+  - 全局支持括号化粘贴模式（Bracketed Paste），避免多行粘贴文本意外触发行提交。
 
-## 功能
+---
 
-### TUI
+## 快速开始
 
-- 双栏：本地文件系统 / 远程网盘
-- 远程目录浏览、跳转、过滤、排序、搜索（当前目录递归）
-- 本地过滤、隐藏文件切换、父目录导航
-- 批量标记（空格）后下载 / 上传 / 删除 / 移动 / 复制
-- 传输队列面板：进度、速度、状态、取消
-- 远程 mkdir / rename / move / copy / delete
-- 远程路径 Tab 补全（跳转、移动、复制、新建目录、重命名）
-- 序号快速跳转：`1`–`99`，单位数稍候生效，两位数立即跳转
-- 底部元数据行：当前选中项的路径、大小、mtime/ctime、`fs_id`、MD5
-- 输入框支持自由光标编辑：`←/→`、`Home/End`、`Delete`、`Ctrl+W`、`Ctrl+U/K`、`Ctrl+A/E`
-- 持久化待办队列：未完成的传输在重启 TUI 后自动恢复
-- 下载：多连接 Range 断点续传、`.pcstui.part`、服务端内容 MD5 校验、保留 mtime
-- 上传：MD5 / slice-MD5 / CRC32 / 分块 MD5、`precreate → superfile2 → create`、持久化断点、分片重试
-- 全局传输并发限制：下载与上传分别限流，避免一次标记大量文件时打满网络/句柄
-- Yazi：在本地当前目录直接启动，退出后刷新本地列表
-- 窄终端自动改为上下分栏；帮助浮层、输入浮层、危险操作确认
+### 编译与安装
 
-### CLI（脚本/冒烟测试）
+确保系统已安装 Rust 1.85+（edition 2024）：
 
 ```bash
+# 克隆仓库
+git clone https://github.com/<your-username>/pcstui.git
+cd pcstui
+
+# 编译 Release 二进制（推荐始终使用 release，Debug 下哈希计算显著变慢）
+cargo build --release
+
+# 可选：安装到系统 PATH
+sudo install -m 755 target/release/pcstui /usr/local/bin/pcstui
+```
+
+### 首次登录
+
+pcstui 支持浏览器 Cookie 中的 `BDUSS` / `STOKEN` 快速登录（不处理验证码与短信风控）：
+
+1. **直接启动 TUI 交互登录**：
+   ```bash
+   ./target/release/pcstui
+   ```
+   首次运行将直接进入登录界面：
+   - 支持直接将浏览器 DevTools 中截取的完整 Cookie 字符串粘贴到 `BDUSS` 输入框，程序将自动解析提取 `BDUSS` 与 `STOKEN`；
+   - 输入完成回车后，程序会先向百度服务端进行在线身份核验，核验通过后才会安全落盘并进入主界面。
+
+2. **命令行登录**：
+   ```bash
+   # 直接传入 Cookie
+   pcstui login --cookie 'BDUSS=...; STOKEN=...'
+
+   # 或分别指定凭据
+   pcstui login --bduss '<BDUSS>' --stoken '<STOKEN>'
+   ```
+
+---
+
+## 终端界面指南（TUI）
+
+默认不带参数启动 `pcstui` 即可进入双栏界面：
+
+```text
+ ┌── 本地文件系统 ──────────┐  ┌── 远程网盘 [/] ────────────┐
+ │ ..                       │  │ 📁 文档/                   │
+ │ 📄 backup.tar.gz         │  │ 📁 照片备份/               │
+ │ 📄 project.rs            │  │ 📄 dataset.zip             │
+ └──────────────────────────┘  └────────────────────────────┘
+ ┌── 传输队列 (按 p 展开) ──────────────────────────────────┐
+ │ ↓ dataset.zip  [████████░░] 80.2%  12.4 MB/s  (4 连接)   │
+ └──────────────────────────────────────────────────────────┘
+ [选中项元数据: 路径/大小/修改时间/fs_id/MD5]
+ [快捷操作提示栏]
+```
+
+### 常用快捷键
+
+| 按键 | 功能说明 |
+| :--- | :--- |
+| `Tab` / `Shift+Tab` | 切换焦点（本地面板 / 远程面板 / 传输队列） |
+| `↑` `↓` `PgUp` `PgDn` | 列表上下移动光标 |
+| `1`–`99` | 快速数字跳转（快速定位当前面板第 N 项） |
+| `Enter` / `→` | 进入目录；本地文件触发上传；远程文件触发下载 |
+| `Backspace` / `←` | 返回上级目录 |
+| `Space` | 标记 / 取消标记选中项（支持跨文件多选批量操作） |
+| `d` | 下载选中的远程项目到本地当前目录 |
+| `u` | 上传选中的本地项目到远程当前目录 |
+| `x` | 删除选中项目（需弹出确认，默认取消，键入 `y` 执行） |
+| `m` / `c` | 移动 / 复制选中的远程项目（输入框支持 `Tab` 补全路径） |
+| `R` | 重命名选中的远程文件/目录（支持行内自由移动光标） |
+| `n` | 在当前远程目录下新建文件夹 |
+| `g` | 绝对路径跳转（支持 `Tab` 自动补全远端路径） |
+| `/` | 快速过滤当前面板列表（本地过滤无需网络请求） |
+| `f` | 在当前远程目录下递归搜索关键字 |
+| `s` | 远程面板排序切换；本地面板切换是否显示隐藏文件 |
+| `h` | 本地面板显示 / 隐藏点文件（dotfiles） |
+| `r` | 刷新当前面板数据 |
+| `p` | 展开 / 折叠底部实时传输任务面板 |
+| `K` | 取消传输面板中当前选中的传输任务 |
+| `y` | 在本地当前目录就地唤起 Yazi 文件管理器（退出后自动刷新） |
+| `o` | 使用系统关联默认程序打开本地文件（如 `xdg-open`） |
+| `C` | 打开“配置与诊断面板”（查看账号/配额/路径、导出、导入、重新登录） |
+| `?` | 打开 / 关闭帮助浮层 |
+| `q` | 退出程序（若有正在进行的传输任务，会要求二次确认） |
+
+---
+
+## 命令行用法（CLI）
+
+除了丰富的 TUI 界面，`pcstui` 还提供了符合 Unix 管道习惯的轻量命令行接口：
+
+```bash
+# 查询当前登录账号与网盘容量
 pcstui whoami
 pcstui quota
-pcstui ls /apps/bypy/saved
-pcstui search 关键字 --dir /apps/bypy/saved
-pcstui download /apps/bypy/saved/a.bin --dest ./downloads
-pcstui download /apps/bypy/saved/a.bin --dest ./downloads --connections 8 --retries 5
-pcstui upload ./a.bin --dest /apps/bypy/saved
-pcstui mkdir /apps/bypy/saved/new
-pcstui mv /apps/bypy/saved/a /apps/bypy/saved/b
-pcstui cp /apps/bypy/saved/a /apps/bypy/saved/b
-pcstui rename /apps/bypy/saved/a /apps/bypy/saved/c
-pcstui rm /apps/bypy/saved/a --yes
+
+# 列出网盘目录（支持 --json 与详细模式 --long）
+pcstui ls /apps/notes
+pcstui ls /apps/notes --long
+
+# 搜索网盘文件
+pcstui search 学习资料 --dir /
+
+# 下载文件或整个目录
+pcstui download /远程路径/file.zip --dest ./downloads
+pcstui download /远程路径/folder/ --dest ./downloads
+
+# 上传文件或整个目录
+pcstui upload ./local_file.pdf --dest /我的资料
+pcstui upload ./folder/ --dest /我的资料
+
+# 远程管理操作
+pcstui mkdir /远程路径/新目录
+pcstui mv /远程路径/a.txt /远程路径/b.txt
+pcstui cp /远程路径/a.txt /远程路径/backup/
+pcstui rename /远程路径/old.txt /远程路径/new.txt
+pcstui rm /远程路径/temp/ --yes
+
+# 运行本地与网络诊断自检
 pcstui doctor
 ```
 
-默认没有子命令时启动 TUI。
+---
 
-## 安装与构建
+## 配置与迁移
 
-要求 Rust 1.85+（edition 2024）。
+### 配置文件位置
 
-```bash
-cd /home/mat/pansync/pcstui
-cargo build --release
-install -m 755 target/release/pcstui bin/pcstui   # 可选
-```
-
-运行：
-
-```bash
-cargo run --release
-# 或
-./target/release/pcstui
-```
-
-> 请始终使用 release 构建。debug 构建下上传前的 MD5/CRC32 计算会慢一个数量级（实测 64 MiB 文件：release 约 15 秒完成上传，debug 需要数分钟）。
-
-## 首次登录与配置
-
-不支持密码/验证码登录（避免处理验证码、短信、二次验证和风控），使用浏览器 Cookie 中的 `BDUSS` / `STOKEN`。
-
-### TUI 登录页
-
-首次启动（`config/pcstui.json` 不存在或不含账号）会直接进入登录页：
-
-- `BDUSS` / `STOKEN` 输入框默认掩码显示；
-- 可直接把浏览器里的完整 Cookie 粘贴到 `BDUSS` 字段，会自动拆出 `STOKEN`；
-- 第三项可填另一台机器导出的明文 `pcstui.json` 路径，直接导入账号；
-- 按 `Enter` 后先在线验证，验证通过才写入配置；失败会停留在登录页并显示原因；
-- 写入前会把旧配置备份为 `pcstui.json.bak-<时间戳>`；
-- `Esc` 退出。
-
-### 命令行登录
-
-在 TTY 下直接运行 `pcstui login` 会打开同一个登录页；带参数时走无头流程。`uid` 可省略，登录后自动获取。
-
-```bash
-# 打开 TUI 登录页
-pcstui login
-
-# 直接传入凭据；--cookie 可粘贴完整 Cookie
-pcstui login --cookie 'BDUSS=...; STOKEN=...'
-pcstui login --bduss '<BDUSS>' --stoken '<STOKEN>'
-
-# 换机/恢复：在 TUI 中按 C，再用 i 导入明文 pcstui.json
-pcstui
-
-# 只生成空配置，随后手工编辑
-pcstui config init
-$EDITOR config/pcstui.json
-```
-
-`uid` 不是必填项：下载签名接受 `0`，登录成功后会从在线账号自动回填。`--uid` 仅作为可选覆盖。
-
-### 可移植配置
-
-`config/pcstui.json` 是唯一的凭据载体，复制它即可换机。TUI 内的“配置与诊断”面板（`C`）是主入口：
-
-| 键 | 操作 |
-| --- | --- |
-| `e` | 导出含账号凭据的明文副本（`0600`） |
-| `E` | 导出脱敏模板（不含账号，可安全分享） |
-| `i` | 导入明文 `pcstui.json`：先在线验证账号，再确认替换 |
-| `r` | 重新登录（重建客户端与传输引擎，未完成任务保留在队列中） |
-| `d` | 刷新本地权限检查与在线诊断 |
-
-导入不会静默覆盖当前配置：验证失败会保留旧配置；验证成功也要再次确认，替换前自动备份旧文件。导出目标已存在时拒绝写入，且永远不能覆盖当前活动配置。
-
-pcstui 不做凭据加密/解密。需要加密保管时，请自行使用 `age` / `gpg`：
-
-```bash
-age -p -o pcstui.json.age config/pcstui.json
-age -d -o pcstui.json pcstui.json.age
-```
-
-加密文件不能直接导入；面板会明确提示“先解密为明文 pcstui.json”。
-
-CLI 仅保留次级入口，不追求与 TUI 功能对等：
-
-```bash
-pcstui config export ~/pcstui-portable.json
-pcstui config export --redacted ~/pcstui-template.json
-pcstui config import ~/pcstui-portable.json
-```
-
-导出的相对下载目录会保留为相对路径，换项目目录后仍可用。
-
-配置默认写入：
+默认情况下，`pcstui` 的全部运行时文件保存在执行程序同级的 `config/` 目录下（便于自包含便携运行）：
 
 ```text
-pcstui/config/pcstui.json          # 0600，账号 + 全部设置
-pcstui/config/queue.json           # 0600，持久化待办队列
-pcstui/config/upload-state/*.json  # 0600
-pcstui/downloads/                  # CLI 默认下载目录（TUI 下载到本地栏当前目录）
-pcstui/tmp/                        # 预留临时目录
+config/
+├── pcstui.json          # 核心配置文件（账号凭据与传输参数，权限 0600）
+├── queue.json           # 待办传输队列存储
+├── upload-state/        # 大文件断点续传状态目录
+└── pcstui.lock          # 单实例互斥文件锁
 ```
 
-可用环境变量覆盖：
+可通过环境变量自定义配置位置：
 
-| 变量 | 含义 |
-| --- | --- |
-| `PCSTUI_HOME` | 项目根目录 |
-| `PCSTUI_CONFIG` | 配置文件路径 |
-| `PCSTUI_CONFIG_DIR` | 配置目录 |
-| `PCSTUI_DOWNLOAD_DIR` | 默认下载目录 |
-| `PCSTUI_TMP_DIR` | 临时目录 |
+| 环境变量 | 说明 |
+| :--- | :--- |
+| `PCSTUI_HOME` | 自定义项目主工作目录（所有配置与队列均存放在其下） |
+| `PCSTUI_CONFIG` | 显式指定 `pcstui.json` 文件路径 |
+| `PCSTUI_CONFIG_DIR` | 显式指定配置存储目录 |
+| `PCSTUI_DOWNLOAD_DIR` | 显式指定默认下载落盘目录 |
 
-查看当前路径与脱敏账号：
+### 换机与备份导出
 
-```bash
-pcstui config show
-pcstui config path
-pcstui doctor
-```
+- **在 TUI 中换机**：按 `C` 打开配置面板，键入 `e` 可导出包含凭据的明文副本；在新机器上按 `C` 键入 `i` 选择该文件，程序将在线验证无误后原子替换并重登。
+- **脱敏分享**：在 TUI 中按 `C` 键入 `E`，或使用 `pcstui config export --redacted template.json`，可导出剥离所有个人账号与 Cookie 的纯净配置模板，供安全分享。
+- **外部加密安全建议**：`pcstui` 遵循“职责单一”原则，不在二进制内部集成不透明的加解密算法。如需备份凭据，建议使用标准的开源工具（如 `age` 或 `gpg`）进行加密保管：
+  ```bash
+  # 加密备份
+  age -p -o pcstui.json.age config/pcstui.json
 
-## TUI 快捷键
+  # 解密还原
+  age -d -o pcstui.json pcstui.json.age
+  ```
 
-| 键 | 作用 |
-| --- | --- |
-| `Tab` / `Shift+Tab` | 本地 / 远程 / 传输面板 |
-| `↑ ↓ PgUp PgDn Home End` | 移动选择 |
-| `1`–`99` | 快速跳转到当前面板第 N 项（单位数稍候生效） |
-| `Enter` / `→` | 进入目录；本地文件上传；远程文件下载 |
-| `Backspace` / `←` | 返回上级目录 |
-| `Space` | 标记/取消标记 |
-| `d` | 下载远程选中项到本地当前目录 |
-| `u` | 上传本地选中项到远程当前目录 |
-| `x` | 删除（确认） |
-| `m` / `c` | 移动 / 复制到指定远程目录 |
-| `R` | 重命名远程选中项 |
-| `n` | 新建远程目录 |
-| `g` | 跳转远程绝对路径 |
-| `/` | 过滤当前面板 |
-| `f` | 搜索网盘 |
-| `s` | 远程排序；本地切换隐藏文件 |
-| `h` | 本地显示/隐藏点文件 |
-| `r` | 刷新 |
-| `p` | 显示/隐藏传输队列 |
-| `K` | 取消选中的传输 |
-| `y` | 在本地当前目录启动 Yazi |
-| `o` | `xdg-open` 打开本地文件 |
-| `C` | 配置与诊断：导出 / 导入 / 重新登录 / 检查 |
-| `?` | 帮助 |
-| `q` | 退出（活动传输时确认） |
+---
 
-输入框（跳转 / 新建 / 移动 / 复制 / 重命名）：
+## 技术架构与实现规范
 
-- `Tab`：请求远程路径补全；只有一个候选时直接补全，多个候选时补全公共前缀或显示候选；
-- `←/→`：移动光标；`Home/End`：行首/行尾；
-- `Delete`：删除光标下字符；`Backspace`：删除光标前字符；
-- `Ctrl+W`：删除左侧单词；`Ctrl+U`：删除到行首；`Ctrl+K`：删除到行尾；
-- `Ctrl+A/E`：行首/行尾。
+详细的设计实现、通信协议规范与自动化验收清单，请参考文档目录：
 
-## 断点、并发与校验
+- [架构设计详解（ARCHITECTURE.md）](docs/ARCHITECTURE.md)：包含 API 客户端分层、Range 下载状态机、分块上传状态机、任务排他锁机制等深度剖析。
+- [功能与场景矩阵（FEATURE-MATRIX.md）](docs/FEATURE-MATRIX.md)：TUI 与 CLI 细项功能对比及路线图。
+- [测试与验收标准（ACCEPTANCE.md）](docs/ACCEPTANCE.md)：全量安全与边缘场景验收清单。
 
-### 下载
+---
 
-- 临时文件：目标目录下 `.<文件名>.<fs_id>.pcstui.part`；`fs_id` 缺失时使用远程路径指纹，避免同名不同文件共用断点
-- 单流重试从 `.part` 长度继续；服务端不支持 Range 时自动从头开始
-- 大文件（≥64 MiB）默认多连接 Range：每个分片 4 MiB，`download_connections` 控制单文件连接数
-- 多连接断点状态：`.<文件名>.<fs_id>.pcstui.part.state.json`，记录分片位图、每个已完成分片的 MD5 和 `.part` 指纹；缺失或截断的 `.part` 会整段丢弃，指纹变化时重新校验已完成分片，避免拼出稀疏文件
-- 分片数据 `sync_data` 成功后才写入断点状态；最终 rename 前再次 `sync_all`，降低崩溃后“状态说完成、数据却没落盘”的风险
-- 服务端返回 403/401 时自动回退到单流下载；单流仍使用闭合 Range，兼容百度大文件限制
-- 下载完成后先校验再原子重命名；保留远端 mtime
-- 百度目录列表对“分片上传合并”的文件会返回 `block_list` JSON 的 MD5，而不是文件内容 MD5；下载器会用下载主机的 `Content-MD5` 响应头做权威校验，因此不会误删正确文件
-- 已存在的同名文件：CLI 默认校验后跳过；TUI 默认自动改名，避免误覆盖
-- `--overwrite` 覆盖，`--rename` 自动改名，`--no-verify` 关闭 MD5
-- `--connections N` / `--retries N` 可覆盖本次下载的配置
+## 开源协议
 
-### 上传
-
-- 上传前单遍计算：整文件 MD5、前 256 KiB slice-MD5、CRC32、分块 MD5
-- 分块大小自动 4/16/64 MiB（`<8 GiB` / `<32 GiB` / 更大），可用 `--chunk-mib` 覆盖
-- 状态文件：`config/upload-state/<hash>.json`，记录 `uploadid`、已确认分片 MD5 和本地整文件 MD5；本地内容变化时不会错误复用旧分片
-- 中断后重新运行同一上传，会复用 `uploadid` 并跳过已完成分片
-- 每个分片最多重试 `transfer.retries` 次（默认 3）
-- 服务端返回的分片 MD5 会与本地计算值比对，不一致按失败重试，避免把坏分片合并进文件
-- 合并完成后再次读取下载主机的 `Content-MD5`，与本地整文件 MD5 比对；明确不一致时上传失败，不会静默报告成功
-- `upload_connections` 控制同时执行的上传任务数（不是单个文件的分片并发）
-- 空文件使用空串 MD5 作为唯一分块，兼容 `precreate`/`create` 的校验要求
-- 秒传（`precreate` 返回 `return_type=2`）直接完成
-
-### 持久化队列
-
-- 路径：`config/queue.json`（0600，原子写入）
-- 记录下载/上传任务及其选项；TUI 启动时自动恢复未完成任务
-- 入队时按任务身份去重：下载使用 `fs_id + 远程路径 + 本地根目录`，上传使用 `本地路径 + 远程目录`；重复任务不会并行写入同一 `.part` 或上传状态
-- 启动恢复时会清理队列中的重复项
-- 任务完成或失败后从队列移除；应用被强制退出时，未完成任务会在下次启动继续
-- 队列只记录任务意图，真正的断点仍由 `.pcstui.part` / `upload-state` 管理
-
-## 配置示例
-
-```json
-{
-  "version": 1,
-  "account": {
-    "uid": 123456,
-    "name": "your-name",
-    "bduss": "...",
-    "stoken": "...",
-    "baiduid": "",
-    "access_token": ""
-  },
-  "app_id": 266719,
-  "pan_ua": "netdisk;P2SP;3.0.0.8;...",
-  "user_agent": "Mozilla/5.0 ...",
-  "download_dir": null,
-  "last_remote_dir": "/",
-  "transfer": {
-    "download_connections": 4,
-    "upload_connections": 2,
-    "max_active_downloads": 3,
-    "retries": 3,
-    "verify_md5": true,
-    "upload_chunk_mib": 0
-  }
-}
-```
-
-字段说明：
-
-- `download_connections`：单个大文件的多连接 Range 连接数（1–16，默认 4）；
-- `upload_connections`：同时执行的上传任务数（1–8，默认 2）；
-- `max_active_downloads`：同时执行的下载任务数（1–8，默认 3）；
-- `retries`：下载请求/分片和上传分片的重试次数（0–10，默认 3）；
-- `verify_md5`：下载完成后是否校验内容 MD5（默认 true）；
-- `upload_chunk_mib`：上传分块大小，0 表示自动 4/16/64 MiB。
-
-## 已知限制（有意收敛）
-
-- 不支持密码/验证码登录、分享链接、离线下载、回收站、多账号切换；
-- 不支持秒传的“旧接口”路径（`rtype=3`），只使用 `precreate` 的秒传返回；
-- 加密下载链接（`encrypt=1`）不尝试破解 pan-home 签名，回退到带 Cookie 的 PCS `download` 端点；
-- 上传分片仍按文件内顺序执行；`upload_connections` 只并发多个文件；
-- 百度接口可能变更，`doctor` 用于快速定位认证/配额/根目录问题；
-- 仅保证 Linux 终端体验（Yazi/`xdg-open` 为 Linux 习惯），Rust 代码本身可移植。
-
-## 测试
-
-```bash
-cargo fmt --check
-cargo test
-cargo build --release
-./target/release/pcstui doctor
-./target/release/pcstui ls /
-```
-
-单元测试覆盖：签名向量、MD5 混淆解码、sign2、路径规范化/本地路径安全、配置导入/导出与脱敏、加密/二进制配置拒绝、备份替换、导出不覆盖活动配置、Cookie 解析、分块哈希、空文件、上传计划、队列去重/往返、断点状态校验、输入光标/单词删除、Tab 补全路径、TUI 配置面板按键隔离、CLI 参数、排序/过滤。
-
-真实 API 冒烟测试需要有效 BDUSS/STOKEN，见 `docs/ACCEPTANCE.md` 的验收清单。
-
-## 目录结构
-
-```text
-pcstui/
-├── src/
-│   ├── api/          # HTTP 客户端、签名、模型
-│   ├── transfer/     # 下载/上传引擎、持久化队列、断点状态、进度事件
-│   ├── tui/          # App 状态、事件循环、ratatui 渲染
-│   ├── cli.rs        # clap 子命令与 headless 流程
-│   ├── config.rs     # 可移植配置、导入/导出、权限、凭据掩码
-│   ├── lib.rs
-│   └── main.rs
-├── docs/
-├── config/           # 运行时生成，已 gitignore
-├── downloads/        # 运行时生成，已 gitignore
-├── LICENSE
-└── NOTICE
-```
-
-## 可移植性
-
-- 源码和 release 可执行文件不含任何账号、Cookie 或本机路径；全部凭据只在运行时从配置文件读取；
-- `config/pcstui.json` 是自包含的：复制到新机器后，在 TUI 配置面板（`C`）用 `i` 导入即可；
-- 配置文件和队列文件以 `0600` 写入，配置目录为 `0700`，写入采用临时文件 + rename 的原子方式；
-- 日志、`Debug` 输出和 `config show` 只显示掩码后的凭据；
-- 不依赖外部百度网盘客户端，也不需要额外目录或环境变量。
+本项目采用 [Apache-2.0 许可证](LICENSE) 分发。
+第三方协议引用归属见 [NOTICE](NOTICE) 文件。
