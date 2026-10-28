@@ -330,6 +330,7 @@ async fn search(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn download(
     config: RuntimeConfig,
     remote: &str,

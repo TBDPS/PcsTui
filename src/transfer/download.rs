@@ -299,6 +299,7 @@ async fn preflight_range(client: &BaiduClient, url: &url::Url) -> bool {
 
 /// Download a single file with HTTP range resume, optional multi-connection
 /// ranges, retries and MD5 checking.
+#[allow(clippy::too_many_arguments, clippy::needless_option_as_deref)]
 pub async fn download_one(
     client: &BaiduClient,
     item: &RemoteItem,
@@ -520,6 +521,7 @@ pub async fn download_one(
     .await
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn download_multi(
     client: &BaiduClient,
     item: &RemoteItem,
@@ -748,15 +750,14 @@ async fn download_multi(
         })
         .buffer_unordered(workers);
 
-    let result = stream
+    stream
         .try_collect::<Vec<u64>>()
         .await
         .map(|_| MultiOutcome::Done)
         .or_else(|err| match err {
             MultiFailure::Unsupported => Ok(MultiOutcome::Unsupported),
             MultiFailure::Other(err) => Err(err),
-        });
-    result
+        })
 }
 
 async fn download_single(
@@ -1005,6 +1006,7 @@ fn is_retryable_status(status: reqwest::StatusCode) -> bool {
         || status.is_server_error()
 }
 
+#[allow(clippy::needless_option_as_deref)]
 async fn finalize_download(
     client: &BaiduClient,
     part: &Path,

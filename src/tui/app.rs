@@ -1526,7 +1526,7 @@ impl App {
             .filter(|item| item.name.to_lowercase().starts_with(&needle))
             .map(|item| (item.name, item.is_dir))
             .collect::<Vec<_>>();
-        names.sort_by(|a, b| a.0.to_lowercase().cmp(&b.0.to_lowercase()));
+        names.sort_by_key(|a| a.0.to_lowercase());
         if names.is_empty() {
             self.set_status(format!("没有匹配 “{prefix}” 的远程项目"), true);
             return;
