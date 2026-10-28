@@ -1,8 +1,9 @@
 /target
-/config/pcstui.json
-/config/queue.json
-/config/upload-state/
+/config/
 /downloads/
 /tmp/
 *.pcstui.part
+*.pcstui.part.state.json
+pcstui-portable-*.json
+pcstui-redacted-*.json
 .DS_Store

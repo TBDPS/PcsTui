@@ -35,7 +35,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     draw_status(frame, chunks[3], app);
 
     if app.help {
-        draw_help(frame, area);
+        draw_help(frame, area, app);
     }
     if let Some(panel) = &app.config_panel {
         draw_config_panel(frame, area, app, panel);
@@ -445,21 +445,28 @@ fn draw_status(frame: &mut Frame, area: Rect, app: &App) {
 }
 
 fn draw_config_panel(frame: &mut Frame, area: Rect, app: &App, panel: &ConfigPanel) {
-    let popup = centered_rect(90, 88, area);
+    let popup = centered_rect(92, 92, area);
     frame.render_widget(Clear, popup);
 
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(ACCENT))
+        .title(" 配置与诊断 ")
+        .style(Style::default().bg(Color::Rgb(20, 24, 28)));
+    let inner = block.inner(popup);
+    frame.render_widget(block, popup);
+
+    let chunks = Layout::vertical([Constraint::Min(0), Constraint::Length(1)]).split(inner);
+
+    let content_area = chunks[0];
+    let footer_area = chunks[1];
+
     let mut lines = vec![
-        Line::from(Span::styled(
-            " 配置与诊断 ",
-            Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
-        )),
-        Line::from(""),
         Line::from(vec![
             Span::styled("账号    ", Style::default().fg(MUTED)),
             Span::raw(app.config.redacted_summary()),
-        ]),
-        Line::from(vec![
-            Span::styled("版本    ", Style::default().fg(MUTED)),
+            Span::styled("    版本 ", Style::default().fg(MUTED)),
             Span::raw(format!("pcstui {}", crate::VERSION)),
         ]),
         Line::from(vec![
@@ -467,23 +474,17 @@ fn draw_config_panel(frame: &mut Frame, area: Rect, app: &App, panel: &ConfigPan
             Span::raw(app.config.paths.config_file.display().to_string()),
         ]),
         Line::from(vec![
-            Span::styled("配置目录", Style::default().fg(MUTED)),
-            Span::raw(app.config.paths.config_dir.display().to_string()),
-        ]),
-        Line::from(vec![
             Span::styled("下载目录", Style::default().fg(MUTED)),
             Span::raw(app.config.download_dir().display().to_string()),
         ]),
         Line::from(vec![
-            Span::styled("队列    ", Style::default().fg(MUTED)),
+            Span::styled("待办队列", Style::default().fg(MUTED)),
             Span::raw(app.config.paths.queue_file.display().to_string()),
         ]),
         Line::from(vec![
             Span::styled("上传断点", Style::default().fg(MUTED)),
             Span::raw(app.config.paths.upload_state_dir.display().to_string()),
-        ]),
-        Line::from(vec![
-            Span::styled("远程目录", Style::default().fg(MUTED)),
+            Span::styled("  远程目录: ", Style::default().fg(MUTED)),
             Span::raw(app.config.file.last_remote_dir.clone()),
         ]),
         Line::from(""),
@@ -525,19 +526,15 @@ fn draw_config_panel(frame: &mut Frame, area: Rect, app: &App, panel: &ConfigPan
         Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
     )));
     lines.push(Line::from(vec![
-        Span::styled(" 账号 ", Style::default().fg(MUTED)),
+        Span::styled(" 账号: ", Style::default().fg(MUTED)),
         Span::raw(online),
-    ]));
-    lines.push(Line::from(vec![
-        Span::styled(" 容量 ", Style::default().fg(MUTED)),
+        Span::styled("   容量: ", Style::default().fg(MUTED)),
         Span::raw(app.quota_line()),
     ]));
     lines.push(Line::from(vec![
-        Span::styled(" 根目录 ", Style::default().fg(MUTED)),
+        Span::styled(" 根目录: ", Style::default().fg(MUTED)),
         Span::raw(remote),
-    ]));
-    lines.push(Line::from(vec![
-        Span::styled(" 活动传输 ", Style::default().fg(MUTED)),
+        Span::styled("   活动传输: ", Style::default().fg(MUTED)),
         Span::raw(app.engine.active_count().to_string()),
     ]));
 
@@ -558,127 +555,180 @@ fn draw_config_panel(frame: &mut Frame, area: Rect, app: &App, panel: &ConfigPan
         "导入会先在线验证账号并备份当前配置；加密文件请先解密为 pcstui.json。",
         Style::default().fg(MUTED),
     )));
-    lines.push(Line::from(""));
-    lines.push(Line::from(vec![
-        key("e"),
-        text(" 导出含凭据  "),
-        key("E"),
-        text(" 导出脱敏  "),
-        key("i"),
-        text(" 导入  "),
-        key("r"),
-        text(" 重新登录  "),
-        key("d"),
-        text(" 刷新  "),
-        key("q/Esc"),
-        text(" 关闭"),
-    ]));
 
     frame.render_widget(
         Paragraph::new(lines)
-            .block(
-                Block::default()
-                    .borders(Borders::ALL)
-                    .border_type(BorderType::Rounded)
-                    .border_style(Style::default().fg(ACCENT))
-                    .title(" 配置与诊断 "),
-            )
             .wrap(Wrap { trim: false })
-            .style(Style::default().bg(Color::Rgb(20, 24, 28))),
-        popup,
+            .scroll((panel.scroll as u16, 0)),
+        content_area,
     );
+
+    let footer = Line::from(vec![
+        key("e"),
+        text(" 导出 "),
+        key("E"),
+        text(" 脱敏 "),
+        key("i"),
+        text(" 导入 "),
+        key("r"),
+        text(" 重新登录 "),
+        key("d"),
+        text(" 刷新 "),
+        key("↑↓"),
+        text(" 滚动 "),
+        key("q/Esc"),
+        text(" 关闭"),
+    ]);
+    frame.render_widget(Paragraph::new(footer), footer_area);
 }
 
-fn draw_help(frame: &mut Frame, area: Rect) {
-    let popup = centered_rect(78, 82, area);
+fn draw_help(frame: &mut Frame, area: Rect, app: &App) {
+    let popup = centered_rect(88, 90, area);
     frame.render_widget(Clear, popup);
-    let lines = vec![
-        Line::from(Span::styled(
-            " pcstui 快捷键 ",
-            Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
-        )),
-        Line::from(""),
-        Line::from(vec![key("Tab"), text("  切换本地 / 远程 / 传输面板")]),
-        Line::from(vec![key("↑ ↓ PgUp PgDn"), text("  移动选择")]),
-        Line::from(vec![
-            key("1-99"),
-            text("  快速跳转；单位数稍候生效，两位数立即跳转"),
-        ]),
-        Line::from(vec![
-            key("Enter / →"),
-            text("  进入目录；本地文件上传；远程文件下载"),
-        ]),
-        Line::from(vec![key("Backspace / ←"), text("  返回上级目录")]),
-        Line::from(vec![key("Space"), text("  标记 / 取消标记（批量操作）")]),
-        Line::from(vec![key("d"), text("  下载远程选中项（仅远程面板）")]),
-        Line::from(vec![key("u"), text("  上传本地选中项（仅本地面板）")]),
-        Line::from(vec![
-            key("x"),
-            text("  删除本地/远程选中项（需确认，默认取消）"),
-        ]),
-        Line::from(vec![
-            key("m / c"),
-            text("  移动 / 复制远程选中项（仅远程面板）"),
-        ]),
-        Line::from(vec![key("R"), text("  重命名远程选中项（仅远程面板）")]),
-        Line::from(vec![key("n"), text("  新建远程目录（仅远程面板）")]),
-        Line::from(vec![key("g"), text("  跳转到远程绝对路径（仅远程面板）")]),
-        Line::from(vec![
-            key("Tab"),
-            text("  在跳转/移动/复制/新建/重命名输入框中补全远程路径"),
-        ]),
-        Line::from(vec![key("/"), text("  过滤当前面板（本地/远程）")]),
-        Line::from(vec![key("f"), text("  搜索网盘（仅远程面板）")]),
-        Line::from(vec![key("s"), text("  远程排序；本地切换隐藏文件")]),
-        Line::from(vec![
-            key("h"),
-            text("  本地显示 / 隐藏点文件（仅本地面板）"),
-        ]),
-        Line::from(vec![key("r"), text("  刷新当前面板（本地/远程）")]),
-        Line::from(vec![key("p"), text("  显示 / 隐藏传输队列")]),
-        Line::from(vec![
-            key("C"),
-            text("  配置与诊断（导出 / 导入 / 重新登录 / 检查）"),
-        ]),
-        Line::from(vec![
-            key("K"),
-            text("  取消传输面板中选中的任务（仅传输面板）"),
-        ]),
-        Line::from(vec![
-            key("y"),
-            text("  在本地当前目录启动 Yazi（仅本地面板）"),
-        ]),
-        Line::from(vec![
-            key("o"),
-            text("  用 xdg-open 打开本地文件（仅本地面板）"),
-        ]),
-        Line::from(vec![key("?"), text("  关闭帮助")]),
-        Line::from(vec![key("q"), text("  退出（有活动传输时确认）")]),
-        Line::from(""),
-        Line::from(Span::styled(
-            "危险操作会先按 fs_id 重新确认远程项目身份；项目已变化时整批中止。",
-            Style::default().fg(MUTED),
-        )),
-        Line::from(Span::styled(
-            "提示：多连接下载断点保存在 .<文件名>.pcstui.part 与 .state.json；上传断点保存在 config/upload-state/。",
-            Style::default().fg(MUTED),
-        )),
-        Line::from(Span::styled(
-            "待办队列保存在 config/queue.json，重启后会自动恢复未完成的传输任务。",
-            Style::default().fg(MUTED),
-        )),
-    ];
-    let paragraph = Paragraph::new(lines)
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .border_type(BorderType::Rounded)
-                .border_style(Style::default().fg(ACCENT))
-                .title(" 帮助 "),
-        )
-        .wrap(Wrap { trim: false })
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(ACCENT))
+        .title(" pcstui 快捷键与帮助 ")
         .style(Style::default().bg(Color::Rgb(20, 24, 28)));
-    frame.render_widget(paragraph, popup);
+    let inner = block.inner(popup);
+    frame.render_widget(block, popup);
+
+    if inner.width >= 70 && inner.height >= 16 {
+        // Two-column layout for wide enough terminals (e.g. 90x30)
+        let chunks = Layout::vertical([
+            Constraint::Length(14),
+            Constraint::Length(1),
+            Constraint::Min(2),
+        ])
+        .split(inner);
+
+        let col_chunks =
+            Layout::horizontal([Constraint::Percentage(50), Constraint::Percentage(50)])
+                .split(chunks[0]);
+
+        let left = vec![
+            Line::from(vec![key("Tab"), text("  切换本地/远程/传输面板")]),
+            Line::from(vec![key("↑ ↓ / Pg"), text("  移动选择光标")]),
+            Line::from(vec![key("1-99"), text("  快速跳转序号")]),
+            Line::from(vec![key("Enter/→"), text("  进入目录 / 下载 / 上传")]),
+            Line::from(vec![key("Back/←"), text("  返回上级目录")]),
+            Line::from(vec![key("Space"), text("  标记 / 取消标记（批量）")]),
+            Line::from(vec![key("d"), text("  下载远程选中项")]),
+            Line::from(vec![key("u"), text("  上传本地选中项")]),
+            Line::from(vec![key("x"), text("  删除选中项（需二次确认）")]),
+            Line::from(vec![key("m / c"), text("  移动 / 复制远程选中项")]),
+            Line::from(vec![key("R"), text("  重命名远程选中项")]),
+            Line::from(vec![key("n"), text("  新建远程目录")]),
+            Line::from(vec![key("g"), text("  跳转到远程绝对路径")]),
+        ];
+
+        let right = vec![
+            Line::from(vec![key("Tab"), text("  输入框自动补全远程路径")]),
+            Line::from(vec![key("/"), text("  过滤当前面板项目")]),
+            Line::from(vec![key("f"), text("  搜索网盘文件")]),
+            Line::from(vec![key("s"), text("  远程排序 / 本地隐藏点")]),
+            Line::from(vec![key("h"), text("  显示 / 隐藏点文件")]),
+            Line::from(vec![key("r"), text("  刷新当前面板")]),
+            Line::from(vec![key("p"), text("  显示 / 隐藏传输面板")]),
+            Line::from(vec![key("C"), text("  配置与诊断面板")]),
+            Line::from(vec![key("K"), text("  取消选中的传输任务")]),
+            Line::from(vec![key("y"), text("  当前目录启动 Yazi")]),
+            Line::from(vec![key("o"), text("  xdg-open 打开本地文件")]),
+            Line::from(vec![key("?"), text("  打开 / 关闭帮助")]),
+            Line::from(vec![key("q"), text("  退出 pcstui")]),
+        ];
+
+        frame.render_widget(Paragraph::new(left), col_chunks[0]);
+        frame.render_widget(Paragraph::new(right), col_chunks[1]);
+
+        let notes = vec![
+            Line::from(Span::styled(
+                "• 危险操作校验 fs_id · 多连接断点存 .pcstui.part.state.json · 待办队列存 config/queue.json",
+                Style::default().fg(MUTED),
+            )),
+            Line::from(vec![
+                Span::styled("• ", Style::default().fg(MUTED)),
+                key("? / q / Esc / 任意键"),
+                text(" 关闭帮助"),
+            ]),
+        ];
+        frame.render_widget(Paragraph::new(notes), chunks[2]);
+    } else {
+        // Fallback single-column scrollable layout
+        let lines = vec![
+            Line::from(vec![key("Tab"), text("  切换本地 / 远程 / 传输面板")]),
+            Line::from(vec![key("↑ ↓ PgUp PgDn"), text("  移动选择")]),
+            Line::from(vec![key("1-99"), text("  快速跳转序号")]),
+            Line::from(vec![
+                key("Enter / →"),
+                text("  进入目录；本地上传；远程下载"),
+            ]),
+            Line::from(vec![key("Backspace / ←"), text("  返回上级目录")]),
+            Line::from(vec![key("Space"), text("  标记 / 取消标记（批量操作）")]),
+            Line::from(vec![key("d"), text("  下载远程选中项（仅远程面板）")]),
+            Line::from(vec![key("u"), text("  上传本地选中项（仅本地面板）")]),
+            Line::from(vec![
+                key("x"),
+                text("  删除本地/远程选中项（需确认，默认取消）"),
+            ]),
+            Line::from(vec![
+                key("m / c"),
+                text("  移动 / 复制远程选中项（仅远程面板）"),
+            ]),
+            Line::from(vec![key("R"), text("  重命名远程选中项（仅远程面板）")]),
+            Line::from(vec![key("n"), text("  新建远程目录（仅远程面板）")]),
+            Line::from(vec![key("g"), text("  跳转到远程绝对路径（仅远程面板）")]),
+            Line::from(vec![
+                key("Tab"),
+                text("  在跳转/移动/复制/新建/重命名输入框中补全远程路径"),
+            ]),
+            Line::from(vec![key("/"), text("  过滤当前面板（本地/远程）")]),
+            Line::from(vec![key("f"), text("  搜索网盘（仅远程面板）")]),
+            Line::from(vec![key("s"), text("  远程排序；本地切换隐藏文件")]),
+            Line::from(vec![
+                key("h"),
+                text("  本地显示 / 隐藏点文件（仅本地面板）"),
+            ]),
+            Line::from(vec![key("r"), text("  刷新当前面板（本地/远程）")]),
+            Line::from(vec![key("p"), text("  显示 / 隐藏传输队列")]),
+            Line::from(vec![
+                key("C"),
+                text("  配置与诊断（导出 / 导入 / 重新登录 / 检查）"),
+            ]),
+            Line::from(vec![
+                key("K"),
+                text("  取消传输面板中选中的任务（仅传输面板）"),
+            ]),
+            Line::from(vec![
+                key("y"),
+                text("  在本地当前目录启动 Yazi（仅本地面板）"),
+            ]),
+            Line::from(vec![
+                key("o"),
+                text("  用 xdg-open 打开本地文件（仅本地面板）"),
+            ]),
+            Line::from(vec![key("? / q / Esc"), text("  关闭帮助")]),
+            Line::from(""),
+            Line::from(Span::styled(
+                "危险操作会先按 fs_id 重新确认远程项目身份；项目已变化时整批中止。",
+                Style::default().fg(MUTED),
+            )),
+            Line::from(Span::styled(
+                "提示：多连接下载断点保存在 .<文件名>.pcstui.part 与 .state.json；上传断点保存在 config/upload-state/。",
+                Style::default().fg(MUTED),
+            )),
+            Line::from(Span::styled(
+                "待办队列保存在 config/queue.json，重启后会自动恢复未完成的传输任务。",
+                Style::default().fg(MUTED),
+            )),
+        ];
+        frame.render_widget(
+            Paragraph::new(lines).scroll((app.help_scroll as u16, 0)),
+            inner,
+        );
+    }
 }
 
 fn draw_input(frame: &mut Frame, area: Rect, input: &crate::tui::app::InputState) {

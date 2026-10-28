@@ -119,13 +119,12 @@ async fn event_loop(
     Ok(())
 }
 
+/// Initialize the terminal for the main TUI with bracketed paste enabled.
 pub(crate) fn init_terminal() -> Result<Terminal<CrosstermBackend<Stdout>>> {
-    init_terminal_with_paste(false)
+    init_terminal_with_paste(true)
 }
 
-/// The login form needs bracketed paste so a whole cookie arrives as one
-/// event. The main TUI keeps the old key-by-key behavior because it does not
-/// have a paste handler.
+/// Initialize the terminal for the login screen with bracketed paste enabled.
 pub(crate) fn init_login_terminal() -> Result<Terminal<CrosstermBackend<Stdout>>> {
     init_terminal_with_paste(true)
 }

@@ -19,6 +19,7 @@ pub struct ConfigPanel {
     pub checks: Vec<Check>,
     pub message: Option<(String, bool)>,
     pub busy: bool,
+    pub scroll: usize,
 }
 
 impl ConfigPanel {
@@ -66,7 +67,16 @@ impl ConfigPanel {
             checks,
             message: None,
             busy: false,
+            scroll: 0,
         }
+    }
+
+    pub fn scroll_up(&mut self, amount: usize) {
+        self.scroll = self.scroll.saturating_sub(amount);
+    }
+
+    pub fn scroll_down(&mut self, amount: usize) {
+        self.scroll = self.scroll.saturating_add(amount);
     }
 
     pub fn refresh_local(&mut self, config: &RuntimeConfig, queue_error: Option<&str>) {

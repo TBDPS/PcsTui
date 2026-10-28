@@ -568,7 +568,48 @@ fn backup_config_file(path: &Path) -> Result<PathBuf> {
     handle.write_all(&data)?;
     handle.sync_all()?;
     set_file_private(&candidate);
+    let _ = prune_old_backups(parent, name, 3);
     Ok(candidate)
+}
+
+/// Retain at most `keep` newest backup files matching `{base_name}.bak-*`.
+pub(crate) fn prune_old_backups(parent: &Path, base_name: &str, keep: usize) -> Result<usize> {
+    let prefix = format!("{base_name}.bak-");
+    let mut backups: Vec<(std::time::SystemTime, String, PathBuf)> = Vec::new();
+    let entries = match fs::read_dir(parent) {
+        Ok(entries) => entries,
+        Err(_) => return Ok(0),
+    };
+    for entry in entries.flatten() {
+        let file_type = match entry.file_type() {
+            Ok(ft) => ft,
+            Err(_) => continue,
+        };
+        if !file_type.is_file() {
+            continue;
+        }
+        let file_name = entry.file_name().to_string_lossy().to_string();
+        if !file_name.starts_with(&prefix) {
+            continue;
+        }
+        let mtime = entry
+            .metadata()
+            .and_then(|m| m.modified())
+            .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+        backups.push((mtime, file_name, entry.path()));
+    }
+    // Sort descending by (file_name, mtime) so newest backups come first
+    backups.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| b.0.cmp(&a.0)));
+
+    let mut pruned = 0;
+    if backups.len() > keep {
+        for (_, _, path) in &backups[keep..] {
+            if fs::remove_file(path).is_ok() {
+                pruned += 1;
+            }
+        }
+    }
+    Ok(pruned)
 }
 
 /// Trim a pasted credential and reject accidental cookie syntax in a single
@@ -692,15 +733,17 @@ mod tests {
     fn config_round_trips_and_debug_is_redacted() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("pcstui.json");
-        let mut file = ConfigFile::default();
-        file.account = Some(Account {
-            uid: 42,
-            name: "tester".to_string(),
-            bduss: "BDUSS_SECRET_1234".to_string(),
-            stoken: "STOKEN_SECRET_5678".to_string(),
-            baiduid: String::new(),
-            access_token: String::new(),
-        });
+        let file = ConfigFile {
+            account: Some(Account {
+                uid: 42,
+                name: "tester".to_string(),
+                bduss: "BDUSS_SECRET_1234".to_string(),
+                stoken: "STOKEN_SECRET_5678".to_string(),
+                baiduid: String::new(),
+                access_token: String::new(),
+            }),
+            ..Default::default()
+        };
         write_config_file(&path, &file, true).unwrap();
         let loaded = ConfigFile::read(&path).unwrap();
         let account = loaded.account.as_ref().unwrap();
@@ -721,15 +764,17 @@ mod tests {
     #[test]
     fn redacted_export_has_no_account() {
         let dir = tempfile::tempdir().unwrap();
-        let mut file = ConfigFile::default();
-        file.account = Some(Account {
-            uid: 42,
-            name: "tester".to_string(),
-            bduss: "BDUSS_SECRET_1234".to_string(),
-            stoken: "STOKEN_SECRET_5678".to_string(),
-            baiduid: String::new(),
-            access_token: String::new(),
-        });
+        let file = ConfigFile {
+            account: Some(Account {
+                uid: 42,
+                name: "tester".to_string(),
+                bduss: "BDUSS_SECRET_1234".to_string(),
+                stoken: "STOKEN_SECRET_5678".to_string(),
+                baiduid: String::new(),
+                access_token: String::new(),
+            }),
+            ..Default::default()
+        };
         let config = RuntimeConfig {
             paths: test_paths(dir.path()),
             file,
@@ -745,16 +790,18 @@ mod tests {
     fn portable_export_imports_on_another_machine() {
         let source = tempfile::tempdir().unwrap();
         let target = tempfile::tempdir().unwrap();
-        let mut file = ConfigFile::default();
-        file.account = Some(Account {
-            uid: 42,
-            name: "tester".to_string(),
-            bduss: "BDUSS_SECRET_1234".to_string(),
-            stoken: "STOKEN_SECRET_5678".to_string(),
-            baiduid: String::new(),
-            access_token: String::new(),
-        });
-        file.download_dir = Some(source.path().join("downloads"));
+        let file = ConfigFile {
+            account: Some(Account {
+                uid: 42,
+                name: "tester".to_string(),
+                bduss: "BDUSS_SECRET_1234".to_string(),
+                stoken: "STOKEN_SECRET_5678".to_string(),
+                baiduid: String::new(),
+                access_token: String::new(),
+            }),
+            download_dir: Some(source.path().join("downloads")),
+            ..Default::default()
+        };
         let config = RuntimeConfig {
             paths: test_paths(source.path()),
             file,
@@ -799,15 +846,17 @@ mod tests {
 
     #[test]
     fn incomplete_account_is_rejected() {
-        let mut file = ConfigFile::default();
-        file.account = Some(Account {
-            uid: 0,
-            name: String::new(),
-            bduss: "only-bduss".to_string(),
-            stoken: String::new(),
-            baiduid: String::new(),
-            access_token: String::new(),
-        });
+        let file = ConfigFile {
+            account: Some(Account {
+                uid: 0,
+                name: String::new(),
+                bduss: "only-bduss".to_string(),
+                stoken: String::new(),
+                baiduid: String::new(),
+                access_token: String::new(),
+            }),
+            ..Default::default()
+        };
         assert!(!file.has_account());
         assert!(file.account_or_err().is_err());
     }
@@ -940,8 +989,10 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let source = tempfile::tempdir().unwrap();
         let source_path = source.path().join("portable.json");
-        let mut source_file = ConfigFile::default();
-        source_file.account = Some(account("IMPORTED_BDUSS"));
+        let source_file = ConfigFile {
+            account: Some(account("IMPORTED_BDUSS")),
+            ..Default::default()
+        };
         write_config_file(&source_path, &source_file, false).unwrap();
 
         let paths = test_paths(dir.path());
@@ -966,5 +1017,38 @@ mod tests {
             })
             .count();
         assert_eq!(backups, 1);
+    }
+
+    #[test]
+    fn backup_retention_prunes_old_backups() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_dir = dir.path().join("config");
+        fs::create_dir_all(&config_dir).unwrap();
+
+        // Simulate 5 backup files
+        for i in 1..=5 {
+            let path = config_dir.join(format!("pcstui.json.bak-20261028-12000{i}"));
+            fs::write(&path, format!("backup {i}")).unwrap();
+        }
+
+        let pruned = prune_old_backups(&config_dir, "pcstui.json", 3).unwrap();
+        assert_eq!(pruned, 2);
+
+        let mut remaining: Vec<String> = fs::read_dir(&config_dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().to_string())
+            .collect();
+        remaining.sort();
+
+        // The 3 newest should be kept: 120003, 120004, 120005
+        assert_eq!(
+            remaining,
+            vec![
+                "pcstui.json.bak-20261028-120003",
+                "pcstui.json.bak-20261028-120004",
+                "pcstui.json.bak-20261028-120005",
+            ]
+        );
     }
 }

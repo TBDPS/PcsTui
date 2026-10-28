@@ -547,6 +547,7 @@ pub struct App {
     pub confirm: Option<ConfirmState>,
     pub config_panel: Option<ConfigPanel>,
     pub help: bool,
+    pub help_scroll: usize,
     pub marked_local: HashSet<PathBuf>,
     pub marked_remote: HashMap<String, RemoteRef>,
     pub should_quit: bool,
@@ -603,6 +604,7 @@ impl App {
             confirm: None,
             config_panel: None,
             help: false,
+            help_scroll: 0,
             marked_local: HashSet::new(),
             marked_remote: HashMap::new(),
             should_quit: false,
@@ -1037,8 +1039,29 @@ impl App {
             return;
         }
         if self.help {
-            self.help = false;
-            return;
+            match key.code {
+                KeyCode::Up | KeyCode::Char('k') => {
+                    self.help_scroll = self.help_scroll.saturating_sub(1);
+                    return;
+                }
+                KeyCode::Down | KeyCode::Char('j') => {
+                    self.help_scroll = self.help_scroll.saturating_add(1);
+                    return;
+                }
+                KeyCode::PageUp => {
+                    self.help_scroll = self.help_scroll.saturating_sub(6);
+                    return;
+                }
+                KeyCode::PageDown => {
+                    self.help_scroll = self.help_scroll.saturating_add(6);
+                    return;
+                }
+                _ => {
+                    self.help = false;
+                    self.help_scroll = 0;
+                    return;
+                }
+            }
         }
         if self.confirm.is_some() {
             self.handle_confirm_key(key);
@@ -1066,7 +1089,10 @@ impl App {
         self.quick_at = None;
         match key.code {
             KeyCode::Char('q') => self.request_quit(),
-            KeyCode::Char('?') => self.help = true,
+            KeyCode::Char('?') => {
+                self.help = true;
+                self.help_scroll = 0;
+            }
             KeyCode::Char('C') => self.open_config_panel(),
             KeyCode::Char('p') => {
                 self.show_transfers = !self.show_transfers;
@@ -1253,6 +1279,26 @@ impl App {
             KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('C') => {
                 self.config_panel = None;
                 self.set_status("已关闭配置与诊断", false);
+            }
+            KeyCode::Up | KeyCode::Char('k') => {
+                if let Some(panel) = self.config_panel.as_mut() {
+                    panel.scroll_up(1);
+                }
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                if let Some(panel) = self.config_panel.as_mut() {
+                    panel.scroll_down(1);
+                }
+            }
+            KeyCode::PageUp => {
+                if let Some(panel) = self.config_panel.as_mut() {
+                    panel.scroll_up(5);
+                }
+            }
+            KeyCode::PageDown => {
+                if let Some(panel) = self.config_panel.as_mut() {
+                    panel.scroll_down(5);
+                }
             }
             _ if busy => {
                 self.set_panel_message("正在验证导入配置，请稍候…", false);
@@ -2538,7 +2584,7 @@ mod tests {
     use super::*;
     use crate::config::{Account, ConfigFile, Paths};
 
-    fn test_app() -> (App, tempfile::TempDir) {
+    pub(crate) fn test_app() -> (App, tempfile::TempDir) {
         let dir = tempfile::tempdir().unwrap();
         let paths = Paths {
             root: dir.path().to_path_buf(),
@@ -2882,5 +2928,73 @@ mod tests {
         app.handle_key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::NONE));
         app.handle_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE));
         assert!(app.relogin_requested);
+    }
+
+    #[test]
+    fn ui_at_90x30_renders_config_panel_and_help_without_cutoff() {
+        use crate::tui::ui::draw;
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        let (mut app, _dir) = test_app();
+
+        // 1. Config panel overlay at 90x30
+        app.config_panel = Some(ConfigPanel::open(&app.config, None));
+        let backend = TestBackend::new(90, 30);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|f| draw(f, &mut app)).unwrap();
+
+        let buffer = terminal.backend().buffer().clone();
+        let mut rendered = String::new();
+        for y in 0..buffer.area.height {
+            for x in 0..buffer.area.width {
+                if let Some(cell) = buffer.cell((x, y)) {
+                    rendered.push_str(cell.symbol());
+                }
+            }
+            rendered.push('\n');
+        }
+
+        let squashed: String = rendered.chars().filter(|c| !c.is_whitespace()).collect();
+        assert!(
+            squashed.contains("配置与诊断"),
+            "Missing title in rendered buffer:\n{rendered}"
+        );
+        assert!(
+            squashed.contains("导出"),
+            "Missing export key in rendered buffer:\n{rendered}"
+        );
+        assert!(
+            squashed.contains("关闭"),
+            "Missing close key in rendered buffer:\n{rendered}"
+        );
+
+        // 2. Help overlay at 90x30
+        app.config_panel = None;
+        app.help = true;
+        let backend = TestBackend::new(90, 30);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|f| draw(f, &mut app)).unwrap();
+
+        let buffer = terminal.backend().buffer().clone();
+        let mut rendered = String::new();
+        for y in 0..buffer.area.height {
+            for x in 0..buffer.area.width {
+                if let Some(cell) = buffer.cell((x, y)) {
+                    rendered.push_str(cell.symbol());
+                }
+            }
+            rendered.push('\n');
+        }
+
+        let squashed: String = rendered.chars().filter(|c| !c.is_whitespace()).collect();
+        assert!(
+            squashed.contains("快捷键"),
+            "Missing help title in rendered buffer:\n{rendered}"
+        );
+        assert!(
+            squashed.contains("关闭帮助"),
+            "Missing close help prompt in rendered buffer:\n{rendered}"
+        );
     }
 }
