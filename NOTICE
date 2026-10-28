@@ -1,0 +1,16 @@
+pcstui
+Copyright 2026 pcstui contributors
+
+This product includes software developed as part of BaiduPCS-Go
+(https://github.com/qjfoidnh/BaiduPCS-Go), Copyright qjfoidnh and
+contributors, licensed under the Apache License, Version 2.0.
+
+Ported parts include:
+  * locatedownload time/rand/devuid signing
+  * MD5 obfuscation decoding
+  * sign2 helper
+  * upload precreate/superfile2/create field layout and block sizing
+  * general API endpoint and error-code knowledge
+
+pcstui is an independent Rust implementation. It does not bundle or
+invoke the BaiduPCS-Go binary. See LICENSE for the full Apache-2.0 text.

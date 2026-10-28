@@ -1,0 +1,2119 @@
+use std::collections::{HashMap, HashSet};
+use std::path::{Path, PathBuf};
+use std::time::{Instant, SystemTime};
+
+use anyhow::{Context, Result, anyhow, bail};
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use ratatui::widgets::TableState;
+use tokio::sync::mpsc::UnboundedSender;
+
+use crate::api::BaiduClient;
+use crate::api::models::{
+    Quota, RemoteItem, SortMode, UserInfo, format_bytes, format_timestamp, normalize_remote,
+    remote_join, remote_parent, sanitize_component,
+};
+use crate::config::RuntimeConfig;
+use crate::transfer::types::{
+    Direction, DownloadOptions, TransferEvent, TransferProgress, TransferStatus, UploadOptions,
+};
+use crate::transfer::{QueueStore, QueuedTask, QueuedTaskKind, TransferEngine};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Focus {
+    Local,
+    Remote,
+    Transfers,
+}
+
+impl Focus {
+    fn next(self, transfers_visible: bool) -> Self {
+        match self {
+            Focus::Local if transfers_visible => Focus::Remote,
+            Focus::Local => Focus::Remote,
+            Focus::Remote if transfers_visible => Focus::Transfers,
+            Focus::Remote => Focus::Local,
+            Focus::Transfers => Focus::Local,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Refresh {
+    None,
+    Local,
+    Remote,
+}
+
+#[derive(Debug)]
+pub enum AppEvent {
+    RemoteLoaded {
+        generation: u64,
+        items: Vec<RemoteItem>,
+        error: Option<String>,
+    },
+    SearchLoaded {
+        generation: u64,
+        keyword: String,
+        base: String,
+        items: Vec<RemoteItem>,
+        error: Option<String>,
+    },
+    Quota(Result<Quota, String>),
+    User(Result<UserInfo, String>),
+    TaskDone {
+        message: String,
+        error: bool,
+        refresh: Refresh,
+    },
+    Completions {
+        token: u64,
+        parent: String,
+        prefix: String,
+        items: Vec<RemoteItem>,
+        error: Option<String>,
+    },
+}
+
+#[derive(Debug, Clone)]
+pub struct LocalEntry {
+    pub path: PathBuf,
+    pub name: String,
+    pub is_dir: bool,
+    pub size: u64,
+    pub modified: Option<SystemTime>,
+    pub is_symlink: bool,
+}
+
+pub struct LocalPane {
+    pub cwd: PathBuf,
+    pub entries: Vec<LocalEntry>,
+    pub selected: usize,
+    pub filter: String,
+    pub show_hidden: bool,
+    pub error: Option<String>,
+    pub table_state: TableState,
+}
+
+impl LocalPane {
+    pub fn new(cwd: PathBuf) -> Self {
+        Self {
+            cwd,
+            entries: Vec::new(),
+            selected: 0,
+            filter: String::new(),
+            show_hidden: false,
+            error: None,
+            table_state: TableState::default(),
+        }
+    }
+
+    pub fn reload(&mut self) {
+        self.error = None;
+        let read = match std::fs::read_dir(&self.cwd) {
+            Ok(read) => read,
+            Err(err) => {
+                self.entries.clear();
+                self.error = Some(format!("读取本地目录失败: {err}"));
+                return;
+            }
+        };
+        let mut entries = Vec::new();
+        for entry in read.flatten() {
+            let path = entry.path();
+            let name = entry.file_name().to_string_lossy().to_string();
+            let metadata = match std::fs::symlink_metadata(&path) {
+                Ok(metadata) => metadata,
+                Err(_) => continue,
+            };
+            let is_symlink = metadata.file_type().is_symlink();
+            let followed = if is_symlink {
+                std::fs::metadata(&path).ok()
+            } else {
+                Some(metadata.clone())
+            };
+            let is_dir = followed.as_ref().map(|meta| meta.is_dir()).unwrap_or(false);
+            let size = followed.as_ref().map(|meta| meta.len()).unwrap_or(0);
+            let modified = metadata.modified().ok();
+            entries.push(LocalEntry {
+                path,
+                name,
+                is_dir,
+                size,
+                modified,
+                is_symlink,
+            });
+        }
+        entries.sort_by(|a, b| {
+            b.is_dir
+                .cmp(&a.is_dir)
+                .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
+        });
+        self.entries = entries;
+        self.clamp_selection();
+    }
+
+    pub fn visible_indices(&self) -> Vec<usize> {
+        let needle = self.filter.to_lowercase();
+        self.entries
+            .iter()
+            .enumerate()
+            .filter(|(_, entry)| {
+                (self.show_hidden || !entry.name.starts_with('.'))
+                    && (needle.is_empty() || entry.name.to_lowercase().contains(&needle))
+            })
+            .map(|(index, _)| index)
+            .collect()
+    }
+
+    pub fn visible_len(&self) -> usize {
+        self.visible_indices().len()
+    }
+
+    pub fn current(&self) -> Option<&LocalEntry> {
+        let index = *self.visible_indices().get(self.selected)?;
+        self.entries.get(index)
+    }
+
+    pub fn marked_or_current(&self, marked: &HashSet<PathBuf>) -> Vec<LocalEntry> {
+        if marked.is_empty() {
+            return self.current().cloned().into_iter().collect();
+        }
+        self.entries
+            .iter()
+            .filter(|entry| marked.contains(&entry.path))
+            .cloned()
+            .collect()
+    }
+
+    pub fn clamp_selection(&mut self) {
+        let len = self.visible_len();
+        if len == 0 {
+            self.selected = 0;
+        } else if self.selected >= len {
+            self.selected = len - 1;
+        }
+    }
+
+    pub fn parent(&self) -> Option<PathBuf> {
+        self.cwd.parent().map(Path::to_path_buf)
+    }
+}
+
+#[derive(Debug, Clone)]
+pub enum RemoteMode {
+    Browse,
+    Search { keyword: String, base: String },
+}
+
+pub struct RemotePane {
+    pub cwd: String,
+    pub entries: Vec<RemoteItem>,
+    pub selected: usize,
+    pub filter: String,
+    pub sort: SortMode,
+    pub loading: bool,
+    pub error: Option<String>,
+    pub mode: RemoteMode,
+    pub table_state: TableState,
+}
+
+impl RemotePane {
+    pub fn new(cwd: String) -> Self {
+        Self {
+            cwd,
+            entries: Vec::new(),
+            selected: 0,
+            filter: String::new(),
+            sort: SortMode::NameAsc,
+            loading: false,
+            error: None,
+            mode: RemoteMode::Browse,
+            table_state: TableState::default(),
+        }
+    }
+
+    pub fn visible_indices(&self) -> Vec<usize> {
+        let needle = self.filter.to_lowercase();
+        self.entries
+            .iter()
+            .enumerate()
+            .filter(|(_, entry)| needle.is_empty() || entry.name.to_lowercase().contains(&needle))
+            .map(|(index, _)| index)
+            .collect()
+    }
+
+    pub fn visible_len(&self) -> usize {
+        self.visible_indices().len()
+    }
+
+    pub fn current(&self) -> Option<&RemoteItem> {
+        let index = *self.visible_indices().get(self.selected)?;
+        self.entries.get(index)
+    }
+
+    pub fn marked_or_current(&self, marked: &HashSet<String>) -> Vec<RemoteItem> {
+        if marked.is_empty() {
+            return self.current().cloned().into_iter().collect();
+        }
+        self.entries
+            .iter()
+            .filter(|item| marked.contains(&item.absolute_path(&self.cwd)))
+            .cloned()
+            .collect()
+    }
+
+    pub fn sort_entries(&mut self) {
+        self.sort.sort(&mut self.entries);
+    }
+
+    pub fn clamp_selection(&mut self) {
+        let len = self.visible_len();
+        if len == 0 {
+            self.selected = 0;
+        } else if self.selected >= len {
+            self.selected = len - 1;
+        }
+    }
+
+    pub fn title_path(&self) -> String {
+        match &self.mode {
+            RemoteMode::Browse => self.cwd.clone(),
+            RemoteMode::Search { keyword, base } => format!("搜索 “{keyword}” @ {base}"),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub enum InputKind {
+    FilterLocal,
+    FilterRemote,
+    Search,
+    Mkdir,
+    Goto,
+    Rename { from: String },
+    MoveDest { sources: Vec<String> },
+    CopyDest { sources: Vec<String> },
+}
+
+pub struct InputState {
+    pub title: String,
+    pub prompt: String,
+    pub value: String,
+    /// Cursor position in Unicode scalar values (not bytes).
+    pub cursor: usize,
+    pub kind: InputKind,
+}
+
+impl InputState {
+    pub fn new(
+        title: impl Into<String>,
+        prompt: impl Into<String>,
+        value: String,
+        kind: InputKind,
+    ) -> Self {
+        let cursor = value.chars().count();
+        Self {
+            title: title.into(),
+            prompt: prompt.into(),
+            value,
+            cursor,
+            kind,
+        }
+    }
+
+    fn set_value(&mut self, value: String) {
+        self.cursor = value.chars().count();
+        self.value = value;
+    }
+
+    fn char_count(&self) -> usize {
+        self.value.chars().count()
+    }
+
+    fn insert(&mut self, ch: char) {
+        let byte = char_to_byte(&self.value, self.cursor);
+        self.value.insert(byte, ch);
+        self.cursor += 1;
+    }
+
+    fn backspace(&mut self) {
+        if self.cursor == 0 {
+            return;
+        }
+        let end = char_to_byte(&self.value, self.cursor);
+        let start = char_to_byte(&self.value, self.cursor - 1);
+        self.value.replace_range(start..end, "");
+        self.cursor -= 1;
+    }
+
+    fn delete(&mut self) {
+        if self.cursor >= self.char_count() {
+            return;
+        }
+        let start = char_to_byte(&self.value, self.cursor);
+        let end = char_to_byte(&self.value, self.cursor + 1);
+        self.value.replace_range(start..end, "");
+    }
+
+    fn move_left(&mut self) {
+        self.cursor = self.cursor.saturating_sub(1);
+    }
+
+    fn move_right(&mut self) {
+        self.cursor = (self.cursor + 1).min(self.char_count());
+    }
+
+    fn home(&mut self) {
+        self.cursor = 0;
+    }
+
+    fn end(&mut self) {
+        self.cursor = self.char_count();
+    }
+
+    fn move_word_left(&mut self) {
+        let chars: Vec<char> = self.value.chars().collect();
+        let mut index = self.cursor;
+        while index > 0 && chars[index - 1].is_whitespace() {
+            index -= 1;
+        }
+        while index > 0 && !chars[index - 1].is_whitespace() {
+            index -= 1;
+        }
+        self.cursor = index;
+    }
+
+    fn move_word_right(&mut self) {
+        let chars: Vec<char> = self.value.chars().collect();
+        let mut index = self.cursor;
+        while index < chars.len() && chars[index].is_whitespace() {
+            index += 1;
+        }
+        while index < chars.len() && !chars[index].is_whitespace() {
+            index += 1;
+        }
+        self.cursor = index;
+    }
+
+    fn delete_word_left(&mut self) {
+        let old = self.cursor;
+        self.move_word_left();
+        let start = char_to_byte(&self.value, self.cursor);
+        let end = char_to_byte(&self.value, old);
+        self.value.replace_range(start..end, "");
+    }
+
+    fn delete_to_start(&mut self) {
+        let end = char_to_byte(&self.value, self.cursor);
+        self.value.replace_range(..end, "");
+        self.cursor = 0;
+    }
+
+    fn delete_to_end(&mut self) {
+        let start = char_to_byte(&self.value, self.cursor);
+        self.value.truncate(start);
+    }
+}
+
+fn char_to_byte(value: &str, char_index: usize) -> usize {
+    value
+        .char_indices()
+        .nth(char_index)
+        .map(|(byte, _)| byte)
+        .unwrap_or(value.len())
+}
+
+#[derive(Debug, Clone)]
+pub enum ConfirmAction {
+    DeleteRemote(Vec<String>),
+    DeleteLocal(Vec<PathBuf>),
+    Quit,
+}
+
+pub struct ConfirmState {
+    pub title: String,
+    pub message: String,
+    pub action: ConfirmAction,
+}
+
+pub struct StatusMessage {
+    pub text: String,
+    pub error: bool,
+    pub at: std::time::Instant,
+}
+
+impl StatusMessage {
+    fn new(text: impl Into<String>, error: bool) -> Self {
+        Self {
+            text: text.into(),
+            error,
+            at: std::time::Instant::now(),
+        }
+    }
+}
+
+pub struct App {
+    pub config: RuntimeConfig,
+    pub client: BaiduClient,
+    pub engine: TransferEngine,
+    pub tx: UnboundedSender<AppEvent>,
+    pub local: LocalPane,
+    pub remote: RemotePane,
+    pub focus: Focus,
+    pub transfers: Vec<TransferProgress>,
+    pub transfer_selected: usize,
+    pub transfer_state: TableState,
+    pub show_transfers: bool,
+    pub quota: Option<Quota>,
+    pub user: Option<UserInfo>,
+    pub status: StatusMessage,
+    pub input: Option<InputState>,
+    pub confirm: Option<ConfirmState>,
+    pub help: bool,
+    pub marked_local: HashSet<PathBuf>,
+    pub marked_remote: HashSet<String>,
+    pub should_quit: bool,
+    pub request_yazi: bool,
+    pub dirty_config: bool,
+    pub generation: u64,
+    pub tick: u64,
+    pub queue: QueueStore,
+    pub queue_ids: HashMap<u64, String>,
+    pub queue_error: Option<String>,
+    pub quick_index: String,
+    pub quick_at: Option<Instant>,
+    pub completion_token: u64,
+}
+
+impl App {
+    pub fn new(
+        config: RuntimeConfig,
+        client: BaiduClient,
+        engine: TransferEngine,
+        tx: UnboundedSender<AppEvent>,
+    ) -> Self {
+        let local_cwd = std::env::current_dir().unwrap_or_else(|_| config.paths.root.clone());
+        let mut local = LocalPane::new(local_cwd);
+        local.reload();
+        let remote = RemotePane::new(config.file.last_remote_dir.clone());
+        let (queue, queue_error) = match QueueStore::load(config.paths.queue_file.clone()) {
+            Ok(queue) => (queue, None),
+            Err(err) => (
+                // A corrupt queue must not block the UI. Keep the file for
+                // inspection and start with an empty in-memory queue.
+                QueueStore::empty(config.paths.queue_file.clone()),
+                Some(format!("待办队列读取失败: {err}")),
+            ),
+        };
+        Self {
+            config,
+            client,
+            engine,
+            tx,
+            local,
+            remote,
+            focus: Focus::Local,
+            transfers: Vec::new(),
+            transfer_selected: 0,
+            transfer_state: TableState::default(),
+            show_transfers: false,
+            quota: None,
+            user: None,
+            status: StatusMessage::new("就绪 · Tab 切换 · ? 帮助", false),
+            input: None,
+            confirm: None,
+            help: false,
+            marked_local: HashSet::new(),
+            marked_remote: HashSet::new(),
+            should_quit: false,
+            request_yazi: false,
+            dirty_config: false,
+            generation: 0,
+            tick: 0,
+            queue,
+            queue_ids: HashMap::new(),
+            queue_error,
+            quick_index: String::new(),
+            quick_at: None,
+            completion_token: 0,
+        }
+    }
+
+    pub fn start(&mut self) {
+        self.load_remote();
+        self.load_quota();
+        self.load_user();
+        self.resume_queue();
+        if let Some(error) = self.queue_error.take() {
+            self.set_status(error, true);
+        }
+    }
+
+    pub fn on_tick(&mut self) {
+        self.tick = self.tick.wrapping_add(1);
+        if self
+            .quick_at
+            .map(|at| at.elapsed() >= std::time::Duration::from_millis(450))
+            .unwrap_or(false)
+        {
+            self.apply_quick_index();
+        }
+    }
+
+    pub fn save_if_dirty(&mut self) {
+        if self.dirty_config {
+            if let Err(err) = self.config.save() {
+                self.set_status(format!("保存配置失败: {err}"), true);
+            } else {
+                self.dirty_config = false;
+            }
+        }
+    }
+
+    fn save_queue(&mut self) {
+        if let Err(err) = self.queue.save() {
+            let message = format!("待办队列保存失败: {err}");
+            self.queue_error = Some(message.clone());
+            self.set_status(message, true);
+        }
+    }
+
+    fn enqueue_download(
+        &mut self,
+        item: RemoteItem,
+        cwd: String,
+        dest: PathBuf,
+        options: DownloadOptions,
+    ) -> u64 {
+        let task = QueuedTask::download(item.clone(), cwd.clone(), dest.clone(), options.clone());
+        let queue_id = task.id.clone();
+        self.queue.add(task);
+        self.save_queue();
+        let id = self.engine.spawn_download(item, cwd, dest, options);
+        self.queue_ids.insert(id, queue_id);
+        id
+    }
+
+    fn enqueue_upload(
+        &mut self,
+        local: PathBuf,
+        remote_dir: String,
+        options: UploadOptions,
+    ) -> u64 {
+        let task = QueuedTask::upload(local.clone(), remote_dir.clone(), options.clone());
+        let queue_id = task.id.clone();
+        self.queue.add(task);
+        self.save_queue();
+        let id = self.engine.spawn_upload(local, remote_dir, options);
+        self.queue_ids.insert(id, queue_id);
+        id
+    }
+
+    fn resume_queue(&mut self) {
+        if self.queue.tasks.is_empty() {
+            return;
+        }
+        let tasks = self.queue.tasks.clone();
+        let count = tasks.len();
+        for task in tasks {
+            let id = match &task.task {
+                QueuedTaskKind::Download {
+                    item,
+                    cwd,
+                    download_root,
+                    options,
+                } => self.engine.spawn_download(
+                    item.clone(),
+                    cwd.clone(),
+                    download_root.clone(),
+                    options.clone(),
+                ),
+                QueuedTaskKind::Upload {
+                    local,
+                    remote_dir,
+                    options,
+                } => self
+                    .engine
+                    .spawn_upload(local.clone(), remote_dir.clone(), options.clone()),
+            };
+            self.queue_ids.insert(id, task.id.clone());
+        }
+        self.set_status(format!("已恢复 {count} 个待办传输任务"), false);
+    }
+
+    fn push_quick_index(&mut self, ch: char) {
+        if self.quick_index.is_empty() && ch == '0' {
+            return;
+        }
+        if self.quick_index.len() >= 2 {
+            self.quick_index.clear();
+        }
+        self.quick_index.push(ch);
+        self.quick_at = Some(Instant::now());
+        if self.quick_index.len() == 2 {
+            self.apply_quick_index();
+        }
+    }
+
+    fn apply_quick_index(&mut self) {
+        self.quick_at = None;
+        let digits = std::mem::take(&mut self.quick_index);
+        let Ok(number) = digits.parse::<usize>() else {
+            return;
+        };
+        if number == 0 {
+            return;
+        }
+        let len = match self.focus {
+            Focus::Local => self.local.visible_len(),
+            Focus::Remote => self.remote.visible_len(),
+            Focus::Transfers => self.transfers.len(),
+        };
+        let target = number - 1;
+        if target >= len {
+            self.set_status(format!("序号 {number} 超出范围（共 {len} 项）"), true);
+            return;
+        }
+        match self.focus {
+            Focus::Local => self.local.selected = target,
+            Focus::Remote => self.remote.selected = target,
+            Focus::Transfers => self.transfer_selected = target,
+        }
+        self.set_status(format!("跳转到第 {number} 项"), false);
+    }
+
+    pub fn selected_metadata(&self) -> String {
+        match self.focus {
+            Focus::Local => match self.local.current() {
+                Some(entry) => format!(
+                    "本地 {} · {} · 修改 {}",
+                    entry.path.display(),
+                    if entry.is_dir {
+                        "目录".to_string()
+                    } else {
+                        format_bytes(entry.size)
+                    },
+                    local_time(entry.modified)
+                ),
+                None => "本地：无选中项".to_string(),
+            },
+            Focus::Remote => match self.remote.current() {
+                Some(item) => {
+                    let path = item.absolute_path(&self.remote.cwd);
+                    let md5 = if item.md5.is_empty() {
+                        "-"
+                    } else {
+                        item.md5.as_str()
+                    };
+                    format!(
+                        "远程 fs_id {} · MD5 {} · {} · 创建 {} · 修改 {} · {}",
+                        item.fs_id,
+                        md5,
+                        item.display_size(),
+                        format_timestamp(item.ctime),
+                        format_timestamp(item.mtime),
+                        path
+                    )
+                }
+                None => "远程：无选中项".to_string(),
+            },
+            Focus::Transfers => match self.transfers.get(self.transfer_selected) {
+                Some(progress) => format!(
+                    "{} #{} {} · {} → {} · {} / {} · {}",
+                    progress.direction.arrow(),
+                    progress.id,
+                    progress.name,
+                    progress.remote_path,
+                    progress.local_path.display(),
+                    format_bytes(progress.done),
+                    format_bytes(progress.total),
+                    progress.status.label()
+                ),
+                None => "传输：无选中项".to_string(),
+            },
+        }
+    }
+
+    pub fn take_yazi_request(&mut self) -> bool {
+        let requested = self.request_yazi;
+        self.request_yazi = false;
+        requested
+    }
+
+    pub fn on_yazi_done(&mut self, result: Result<(), String>) {
+        match result {
+            Ok(()) => {
+                self.local.reload();
+                self.set_status("Yazi 已退出，本地目录已刷新", false);
+            }
+            Err(err) => self.set_status(err, true),
+        }
+    }
+
+    pub fn handle_event(&mut self, event: AppEvent) {
+        match event {
+            AppEvent::RemoteLoaded {
+                generation,
+                items,
+                error,
+            } => {
+                if generation != self.generation {
+                    return;
+                }
+                self.remote.loading = false;
+                if let Some(error) = error {
+                    self.remote.error = Some(error.clone());
+                    self.remote.entries.clear();
+                    self.set_status(error, true);
+                } else {
+                    self.remote.error = None;
+                    self.remote.entries = items;
+                    self.remote.sort_entries();
+                    self.remote.clamp_selection();
+                }
+            }
+            AppEvent::SearchLoaded {
+                generation,
+                keyword,
+                base,
+                items,
+                error,
+            } => {
+                if generation != self.generation {
+                    return;
+                }
+                self.remote.loading = false;
+                if let Some(error) = error {
+                    self.remote.error = Some(error.clone());
+                    self.remote.entries.clear();
+                    self.set_status(error, true);
+                } else {
+                    self.remote.error = None;
+                    self.remote.mode = RemoteMode::Search { keyword, base };
+                    self.remote.entries = items;
+                    self.remote.sort_entries();
+                    self.remote.selected = 0;
+                    self.remote.clamp_selection();
+                    self.set_status(format!("搜索完成：{} 项", self.remote.entries.len()), false);
+                }
+            }
+            AppEvent::Quota(result) => match result {
+                Ok(quota) => self.quota = Some(quota),
+                Err(err) => self.set_status(format!("容量查询失败: {err}"), true),
+            },
+            AppEvent::User(result) => match result {
+                Ok(user) => self.user = Some(user),
+                Err(err) => self.set_status(format!("账号查询失败: {err}"), true),
+            },
+            AppEvent::TaskDone {
+                message,
+                error,
+                refresh,
+            } => {
+                self.set_status(message, error);
+                match refresh {
+                    Refresh::None => {}
+                    Refresh::Local => self.local.reload(),
+                    Refresh::Remote => self.refresh_remote(),
+                }
+            }
+            AppEvent::Completions {
+                token,
+                parent,
+                prefix,
+                items,
+                error,
+            } => {
+                if token != self.completion_token {
+                    return;
+                }
+                if let Some(error) = error {
+                    self.set_status(format!("补全失败: {error}"), true);
+                    return;
+                }
+                self.apply_completions(&parent, &prefix, items);
+            }
+        }
+    }
+
+    pub fn handle_transfer(&mut self, event: TransferEvent) {
+        match event {
+            TransferEvent::Added(progress) => {
+                if let Some(existing) = self
+                    .transfers
+                    .iter_mut()
+                    .find(|item| item.id == progress.id)
+                {
+                    *existing = progress;
+                } else {
+                    self.transfers.push(progress);
+                }
+                self.show_transfers = true;
+                self.transfer_selected = self.transfers.len().saturating_sub(1);
+                self.set_status("已加入传输队列", false);
+            }
+            TransferEvent::Updated(progress) => {
+                if let Some(existing) = self
+                    .transfers
+                    .iter_mut()
+                    .find(|item| item.id == progress.id)
+                {
+                    *existing = progress;
+                }
+            }
+            TransferEvent::Finished(progress) => {
+                let direction = progress.direction;
+                let transfer_id = progress.id;
+                let completed = progress.status == TransferStatus::Completed;
+                let message = format!(
+                    "{} {}: {}",
+                    direction.label(),
+                    if completed { "完成" } else { "结束" },
+                    progress.name
+                );
+                if let Some(existing) = self
+                    .transfers
+                    .iter_mut()
+                    .find(|item| item.id == transfer_id)
+                {
+                    *existing = progress;
+                }
+                if let Some(queue_id) = self.queue_ids.remove(&transfer_id) {
+                    if self.queue.remove(&queue_id) {
+                        self.save_queue();
+                    }
+                }
+                if completed {
+                    match direction {
+                        Direction::Download => self.local.reload(),
+                        Direction::Upload => self.refresh_remote(),
+                    }
+                }
+                self.set_status(message, !completed);
+            }
+        }
+        self.transfer_selected = self
+            .transfer_selected
+            .min(self.transfers.len().saturating_sub(1));
+    }
+
+    pub fn handle_key(&mut self, key: KeyEvent) {
+        if key.modifiers.contains(KeyModifiers::CONTROL)
+            && matches!(key.code, KeyCode::Char('c') | KeyCode::Char('C'))
+        {
+            self.request_quit();
+            return;
+        }
+        if self.help {
+            self.help = false;
+            return;
+        }
+        if self.confirm.is_some() {
+            self.handle_confirm_key(key);
+            return;
+        }
+        if self.input.is_some() {
+            self.handle_input_key(key);
+            return;
+        }
+        if let KeyCode::Char(ch) = key.code {
+            if !key.modifiers.contains(KeyModifiers::CONTROL)
+                && !key.modifiers.contains(KeyModifiers::ALT)
+                && ch.is_ascii_digit()
+            {
+                self.push_quick_index(ch);
+                return;
+            }
+        }
+        // Any other key ends a pending numeric jump.
+        self.quick_index.clear();
+        self.quick_at = None;
+        match key.code {
+            KeyCode::Char('q') => self.request_quit(),
+            KeyCode::Char('?') => self.help = true,
+            KeyCode::Char('p') => {
+                self.show_transfers = !self.show_transfers;
+                if self.show_transfers {
+                    self.focus = Focus::Transfers;
+                } else if self.focus == Focus::Transfers {
+                    self.focus = Focus::Remote;
+                }
+            }
+            KeyCode::Tab => {
+                self.focus = self.focus.next(self.show_transfers);
+            }
+            KeyCode::BackTab => {
+                self.focus = match self.focus {
+                    Focus::Local if self.show_transfers => Focus::Transfers,
+                    Focus::Local => Focus::Remote,
+                    Focus::Remote => Focus::Local,
+                    Focus::Transfers => Focus::Remote,
+                };
+            }
+            KeyCode::Up => self.move_selection(-1),
+            KeyCode::Down => self.move_selection(1),
+            KeyCode::PageUp => self.move_selection(-10),
+            KeyCode::PageDown => self.move_selection(10),
+            KeyCode::Home => self.select_first(),
+            KeyCode::End => self.select_last(),
+            KeyCode::Enter | KeyCode::Right => self.enter(),
+            KeyCode::Backspace | KeyCode::Left => self.go_parent(),
+            KeyCode::Esc => self.clear_search(),
+            KeyCode::Char('r') => self.refresh_focused(),
+            KeyCode::Char('R') => self.start_rename(),
+            KeyCode::Char('n') => self.start_mkdir(),
+            KeyCode::Char('g') => self.start_goto(),
+            KeyCode::Char('f') => self.start_search(),
+            KeyCode::Char('/') => self.start_filter(),
+            KeyCode::Char('s') => {
+                if matches!(self.focus, Focus::Remote | Focus::Transfers) {
+                    self.remote.sort = self.remote.sort.next();
+                    self.remote.sort_entries();
+                    self.set_status(format!("远程排序: {}", self.remote.sort.label()), false);
+                } else {
+                    self.local.show_hidden = !self.local.show_hidden;
+                    self.local.clamp_selection();
+                }
+            }
+            KeyCode::Char('h') => {
+                self.local.show_hidden = !self.local.show_hidden;
+                self.local.clamp_selection();
+                self.set_status(
+                    if self.local.show_hidden {
+                        "显示隐藏文件"
+                    } else {
+                        "隐藏隐藏文件"
+                    },
+                    false,
+                );
+            }
+            KeyCode::Char(' ') => self.toggle_mark(),
+            KeyCode::Char('d') => self.download_selected(),
+            KeyCode::Char('u') => self.upload_selected(),
+            KeyCode::Char('x') => self.delete_selected(),
+            KeyCode::Char('m') => self.start_move(),
+            KeyCode::Char('c') => self.start_copy(),
+            KeyCode::Char('K') => self.cancel_selected_transfer(),
+            KeyCode::Char('y') => self.request_yazi = true,
+            KeyCode::Char('o') => self.open_local(),
+            _ => {}
+        }
+    }
+
+    fn handle_confirm_key(&mut self, key: KeyEvent) {
+        match key.code {
+            KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => {
+                if let Some(confirm) = self.confirm.take() {
+                    self.execute_confirm(confirm.action);
+                }
+            }
+            KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc | KeyCode::Char('q') => {
+                self.confirm = None;
+                self.set_status("已取消", false);
+            }
+            _ => {}
+        }
+    }
+
+    fn execute_confirm(&mut self, action: ConfirmAction) {
+        match action {
+            ConfirmAction::DeleteRemote(paths) => {
+                let client = self.client.clone();
+                let tx = self.tx.clone();
+                tokio::spawn(async move {
+                    let result = client.remove(&paths).await;
+                    let (message, error) = match result {
+                        Ok(()) => (format!("已删除 {} 项", paths.len()), false),
+                        Err(err) => (format!("删除失败: {err}"), true),
+                    };
+                    let _ = tx.send(AppEvent::TaskDone {
+                        message,
+                        error,
+                        refresh: Refresh::Remote,
+                    });
+                });
+                self.marked_remote.clear();
+            }
+            ConfirmAction::DeleteLocal(paths) => {
+                let mut errors = Vec::new();
+                for path in paths {
+                    let result = if path.is_dir() && !path.is_symlink() {
+                        std::fs::remove_dir_all(&path)
+                    } else {
+                        std::fs::remove_file(&path)
+                    };
+                    if let Err(err) = result {
+                        errors.push(format!("{}: {err}", path.display()));
+                    }
+                }
+                self.marked_local.clear();
+                self.local.reload();
+                if errors.is_empty() {
+                    self.set_status("本地文件已删除", false);
+                } else {
+                    self.set_status(format!("部分删除失败: {}", errors.join("; ")), true);
+                }
+            }
+            ConfirmAction::Quit => {
+                self.should_quit = true;
+            }
+        }
+    }
+
+    fn open_input(&mut self, input: InputState) {
+        self.completion_token = self.completion_token.wrapping_add(1);
+        self.input = Some(input);
+    }
+
+    fn handle_input_key(&mut self, key: KeyEvent) {
+        match key.code {
+            KeyCode::Esc => {
+                self.completion_token = self.completion_token.wrapping_add(1);
+                self.input = None;
+                self.set_status("已取消输入", false);
+                return;
+            }
+            KeyCode::Enter => {
+                self.completion_token = self.completion_token.wrapping_add(1);
+                if let Some(input) = self.input.take() {
+                    self.submit_input(input);
+                }
+                return;
+            }
+            KeyCode::Tab => {
+                self.request_completion();
+                return;
+            }
+            _ => {}
+        }
+        let Some(input) = self.input.as_mut() else {
+            return;
+        };
+        match key.code {
+            KeyCode::Left if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                input.move_word_left()
+            }
+            KeyCode::Right if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                input.move_word_right()
+            }
+            KeyCode::Left => input.move_left(),
+            KeyCode::Right => input.move_right(),
+            KeyCode::Home => input.home(),
+            KeyCode::End => input.end(),
+            KeyCode::Delete => input.delete(),
+            KeyCode::Backspace if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                input.delete_word_left()
+            }
+            KeyCode::Backspace => input.backspace(),
+            KeyCode::Char('a') if key.modifiers.contains(KeyModifiers::CONTROL) => input.home(),
+            KeyCode::Char('e') if key.modifiers.contains(KeyModifiers::CONTROL) => input.end(),
+            KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                input.delete_to_start()
+            }
+            KeyCode::Char('k') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                input.delete_to_end()
+            }
+            KeyCode::Char('w') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                input.delete_word_left()
+            }
+            KeyCode::Char(ch)
+                if !key.modifiers.contains(KeyModifiers::CONTROL)
+                    && !key.modifiers.contains(KeyModifiers::ALT) =>
+            {
+                input.insert(ch)
+            }
+            _ => {}
+        }
+    }
+
+    fn completion_supported(kind: &InputKind) -> bool {
+        matches!(
+            kind,
+            InputKind::Goto
+                | InputKind::Mkdir
+                | InputKind::Rename { .. }
+                | InputKind::MoveDest { .. }
+                | InputKind::CopyDest { .. }
+        )
+    }
+
+    fn request_completion(&mut self) {
+        let Some(input) = self.input.as_ref() else {
+            return;
+        };
+        if !Self::completion_supported(&input.kind) {
+            return;
+        }
+        let cwd = self.remote.cwd.clone();
+        let (parent, prefix) = completion_target(&input.value, &cwd);
+        self.completion_token = self.completion_token.wrapping_add(1);
+        let token = self.completion_token;
+        let client = self.client.clone();
+        let tx = self.tx.clone();
+        let requested_parent = parent.clone();
+        tokio::spawn(async move {
+            let result = client.list_dir(&requested_parent).await;
+            let (items, error) = match result {
+                Ok(items) => (items, None),
+                Err(err) => (Vec::new(), Some(err.to_string())),
+            };
+            let _ = tx.send(AppEvent::Completions {
+                token,
+                parent: requested_parent,
+                prefix,
+                items,
+                error,
+            });
+        });
+        self.set_status("正在获取补全候选…", false);
+    }
+
+    fn apply_completions(&mut self, parent: &str, prefix: &str, items: Vec<RemoteItem>) {
+        let cwd = self.remote.cwd.clone();
+        let Some(input) = self.input.as_ref() else {
+            return;
+        };
+        if !Self::completion_supported(&input.kind) {
+            return;
+        }
+        // Ignore a stale answer if the user has changed the target meanwhile.
+        let (current_parent, current_prefix) = completion_target(&input.value, &cwd);
+        if current_parent != parent || current_prefix != prefix {
+            return;
+        }
+        let absolute_input = input.value.trim_start().starts_with('/');
+        let needle = prefix.to_lowercase();
+        let mut names = items
+            .into_iter()
+            .filter(|item| item.name.to_lowercase().starts_with(&needle))
+            .map(|item| (item.name, item.is_dir))
+            .collect::<Vec<_>>();
+        names.sort_by(|a, b| a.0.to_lowercase().cmp(&b.0.to_lowercase()));
+        if names.is_empty() {
+            self.set_status(format!("没有匹配 “{prefix}” 的远程项目"), true);
+            return;
+        }
+        let common = if names.len() == 1 {
+            let (name, is_dir) = &names[0];
+            format!("{name}{}", if *is_dir { "/" } else { "" })
+        } else {
+            let refs = names
+                .iter()
+                .map(|(name, _)| name.as_str())
+                .collect::<Vec<_>>();
+            common_prefix(&refs)
+        };
+        if names.len() > 1 && common.chars().count() <= prefix.chars().count() {
+            let preview = names
+                .iter()
+                .take(6)
+                .map(|(name, is_dir)| format!("{name}{}", if *is_dir { "/" } else { "" }))
+                .collect::<Vec<_>>()
+                .join("  ");
+            self.set_status(format!("补全候选: {preview}"), false);
+            return;
+        }
+        let new_value = render_completed_path(&cwd, parent, &common, absolute_input);
+        let Some(input) = self.input.as_mut() else {
+            return;
+        };
+        input.set_value(new_value);
+        let count = names.len();
+        self.set_status(
+            if count == 1 {
+                "已补全".to_string()
+            } else {
+                format!("已补全公共前缀（{count} 个候选）")
+            },
+            false,
+        );
+    }
+
+    fn submit_input(&mut self, input: InputState) {
+        let value = input.value.trim().to_string();
+        match input.kind {
+            InputKind::FilterLocal => {
+                self.local.filter = value;
+                self.local.selected = 0;
+                self.local.clamp_selection();
+                self.set_status(
+                    if self.local.filter.is_empty() {
+                        "已清除本地过滤".to_string()
+                    } else {
+                        format!("本地过滤: {}", self.local.filter)
+                    },
+                    false,
+                );
+            }
+            InputKind::FilterRemote => {
+                self.remote.filter = value;
+                self.remote.selected = 0;
+                self.remote.clamp_selection();
+                self.set_status(
+                    if self.remote.filter.is_empty() {
+                        "已清除远程过滤".to_string()
+                    } else {
+                        format!("远程过滤: {}", self.remote.filter)
+                    },
+                    false,
+                );
+            }
+            InputKind::Search => {
+                if value.is_empty() {
+                    return;
+                }
+                let base = self.remote.cwd.clone();
+                self.remote.loading = true;
+                self.remote.error = None;
+                self.generation += 1;
+                let generation = self.generation;
+                let client = self.client.clone();
+                let tx = self.tx.clone();
+                let keyword = value.clone();
+                tokio::spawn(async move {
+                    let result = client.search(&keyword, &base, true).await;
+                    let (items, error) = match result {
+                        Ok(items) => (items, None),
+                        Err(err) => (Vec::new(), Some(err.to_string())),
+                    };
+                    let _ = tx.send(AppEvent::SearchLoaded {
+                        generation,
+                        keyword,
+                        base,
+                        items,
+                        error,
+                    });
+                });
+            }
+            InputKind::Mkdir => {
+                if value.is_empty() {
+                    return;
+                }
+                let path = remote_join(&self.remote.cwd, &value);
+                let client = self.client.clone();
+                let tx = self.tx.clone();
+                tokio::spawn(async move {
+                    let result = crate::transfer::upload::ensure_remote_dir(&client, &path).await;
+                    let (message, error) = match result {
+                        Ok(()) => (format!("已创建: {path}"), false),
+                        Err(err) => (format!("创建目录失败: {err}"), true),
+                    };
+                    let _ = tx.send(AppEvent::TaskDone {
+                        message,
+                        error,
+                        refresh: Refresh::Remote,
+                    });
+                });
+            }
+            InputKind::Goto => {
+                if value.is_empty() {
+                    return;
+                }
+                self.navigate_remote(normalize_remote(&value));
+            }
+            InputKind::Rename { from } => {
+                if value.is_empty() {
+                    return;
+                }
+                let to = if value.starts_with('/') {
+                    normalize_remote(&value)
+                } else {
+                    remote_join(&remote_parent(&from), &value)
+                };
+                let client = self.client.clone();
+                let tx = self.tx.clone();
+                tokio::spawn(async move {
+                    let result = client.rename(&from, &to).await;
+                    let (message, error) = match result {
+                        Ok(()) => (format!("已重命名: {from} → {to}"), false),
+                        Err(err) => (format!("重命名失败: {err}"), true),
+                    };
+                    let _ = tx.send(AppEvent::TaskDone {
+                        message,
+                        error,
+                        refresh: Refresh::Remote,
+                    });
+                });
+            }
+            InputKind::MoveDest { sources } => {
+                if value.is_empty() || sources.is_empty() {
+                    return;
+                }
+                let dest = normalize_remote(&value);
+                let client = self.client.clone();
+                let tx = self.tx.clone();
+                tokio::spawn(async move {
+                    let result = client.move_paths(&sources, &dest).await;
+                    let (message, error) = match result {
+                        Ok(()) => (format!("已移动 {} 项到 {dest}", sources.len()), false),
+                        Err(err) => (format!("移动失败: {err}"), true),
+                    };
+                    let _ = tx.send(AppEvent::TaskDone {
+                        message,
+                        error,
+                        refresh: Refresh::Remote,
+                    });
+                });
+                self.marked_remote.clear();
+            }
+            InputKind::CopyDest { sources } => {
+                if value.is_empty() || sources.is_empty() {
+                    return;
+                }
+                let dest = normalize_remote(&value);
+                let client = self.client.clone();
+                let tx = self.tx.clone();
+                tokio::spawn(async move {
+                    let result = client.copy_paths(&sources, &dest).await;
+                    let (message, error) = match result {
+                        Ok(()) => (format!("已复制 {} 项到 {dest}", sources.len()), false),
+                        Err(err) => (format!("复制失败: {err}"), true),
+                    };
+                    let _ = tx.send(AppEvent::TaskDone {
+                        message,
+                        error,
+                        refresh: Refresh::Remote,
+                    });
+                });
+                self.marked_remote.clear();
+            }
+        }
+    }
+
+    fn start_filter(&mut self) {
+        match self.focus {
+            Focus::Local => {
+                self.open_input(InputState::new(
+                    "过滤本地",
+                    "输入关键字（留空清除）",
+                    self.local.filter.clone(),
+                    InputKind::FilterLocal,
+                ));
+            }
+            Focus::Remote | Focus::Transfers => {
+                self.open_input(InputState::new(
+                    "过滤远程",
+                    "输入关键字（留空清除）",
+                    self.remote.filter.clone(),
+                    InputKind::FilterRemote,
+                ));
+            }
+        }
+    }
+
+    fn start_search(&mut self) {
+        self.open_input(InputState::new(
+            "搜索网盘",
+            "关键字（当前目录及子目录）",
+            String::new(),
+            InputKind::Search,
+        ));
+    }
+
+    fn start_mkdir(&mut self) {
+        self.open_input(InputState::new(
+            "新建远程目录",
+            format!("在 {} 下创建（可含 /）", self.remote.cwd),
+            String::new(),
+            InputKind::Mkdir,
+        ));
+    }
+
+    fn start_goto(&mut self) {
+        self.open_input(InputState::new(
+            "跳转远程目录",
+            "绝对路径",
+            self.remote.cwd.clone(),
+            InputKind::Goto,
+        ));
+    }
+
+    fn start_rename(&mut self) {
+        let Some(item) = self.remote.current() else {
+            self.set_status("没有选中的远程项目", true);
+            return;
+        };
+        self.open_input(InputState::new(
+            "重命名远程项目",
+            "新名称（可输入完整路径）",
+            item.name.clone(),
+            InputKind::Rename {
+                from: item.absolute_path(&self.remote.cwd),
+            },
+        ));
+    }
+
+    fn start_move(&mut self) {
+        let sources = self
+            .remote
+            .marked_or_current(&self.marked_remote)
+            .iter()
+            .map(|item| item.absolute_path(&self.remote.cwd))
+            .collect::<Vec<_>>();
+        if sources.is_empty() {
+            self.set_status("没有选中的远程项目", true);
+            return;
+        }
+        self.open_input(InputState::new(
+            "移动远程项目",
+            "目标目录（绝对路径）",
+            self.remote.cwd.clone(),
+            InputKind::MoveDest { sources },
+        ));
+    }
+
+    fn start_copy(&mut self) {
+        let sources = self
+            .remote
+            .marked_or_current(&self.marked_remote)
+            .iter()
+            .map(|item| item.absolute_path(&self.remote.cwd))
+            .collect::<Vec<_>>();
+        if sources.is_empty() {
+            self.set_status("没有选中的远程项目", true);
+            return;
+        }
+        self.open_input(InputState::new(
+            "复制远程项目",
+            "目标目录（绝对路径）",
+            self.remote.cwd.clone(),
+            InputKind::CopyDest { sources },
+        ));
+    }
+
+    fn download_selected(&mut self) {
+        let items = self.remote.marked_or_current(&self.marked_remote);
+        if items.is_empty() {
+            self.set_status("没有选中的远程项目", true);
+            return;
+        }
+        let options = DownloadOptions {
+            overwrite: false,
+            rename_existing: true,
+            verify_md5: self.config.file.transfer.verify_md5,
+            connections: self.config.file.transfer.download_connections,
+            retries: self.config.file.transfer.retries,
+        };
+        let dest = self.local.cwd.clone();
+        let cwd = self.remote.cwd.clone();
+        for item in items {
+            self.enqueue_download(item, cwd.clone(), dest.clone(), options.clone());
+        }
+        self.marked_remote.clear();
+        self.set_status("已加入下载队列", false);
+    }
+
+    fn upload_selected(&mut self) {
+        let entries = self.local.marked_or_current(&self.marked_local);
+        if entries.is_empty() {
+            self.set_status("没有选中的本地项目", true);
+            return;
+        }
+        let options = UploadOptions {
+            chunk_mib: self.config.file.transfer.upload_chunk_mib,
+            retries: self.config.file.transfer.retries,
+        };
+        let dest = self.remote.cwd.clone();
+        for entry in entries {
+            self.enqueue_upload(entry.path, dest.clone(), options.clone());
+        }
+        self.marked_local.clear();
+        self.set_status("已加入上传队列", false);
+    }
+
+    fn delete_selected(&mut self) {
+        match self.focus {
+            Focus::Local => {
+                let entries = self.local.marked_or_current(&self.marked_local);
+                if entries.is_empty() {
+                    self.set_status("没有选中的本地项目", true);
+                    return;
+                }
+                let paths = entries.iter().map(|entry| entry.path.clone()).collect();
+                self.confirm = Some(ConfirmState {
+                    title: "删除本地文件".to_string(),
+                    message: format!("确定删除 {} 个本地项目？此操作不可恢复。", entries.len()),
+                    action: ConfirmAction::DeleteLocal(paths),
+                });
+            }
+            Focus::Remote | Focus::Transfers => {
+                let items = self.remote.marked_or_current(&self.marked_remote);
+                if items.is_empty() {
+                    self.set_status("没有选中的远程项目", true);
+                    return;
+                }
+                let paths = items
+                    .iter()
+                    .map(|item| item.absolute_path(&self.remote.cwd))
+                    .collect::<Vec<_>>();
+                self.confirm = Some(ConfirmState {
+                    title: "删除远程文件".to_string(),
+                    message: format!("确定删除 {} 个远程项目？此操作不可恢复。", paths.len()),
+                    action: ConfirmAction::DeleteRemote(paths),
+                });
+            }
+        }
+    }
+
+    fn toggle_mark(&mut self) {
+        match self.focus {
+            Focus::Local => {
+                if let Some(entry) = self.local.current() {
+                    let path = entry.path.clone();
+                    if !self.marked_local.insert(path.clone()) {
+                        self.marked_local.remove(&path);
+                    }
+                }
+            }
+            Focus::Remote | Focus::Transfers => {
+                if let Some(item) = self.remote.current() {
+                    let path = item.absolute_path(&self.remote.cwd);
+                    if !self.marked_remote.insert(path.clone()) {
+                        self.marked_remote.remove(&path);
+                    }
+                }
+            }
+        }
+    }
+
+    fn cancel_selected_transfer(&mut self) {
+        let Some(progress) = self.transfers.get(self.transfer_selected) else {
+            return;
+        };
+        if progress.status.is_terminal() {
+            self.set_status("该传输已结束", false);
+            return;
+        }
+        let id = progress.id;
+        if self.engine.cancel(id) {
+            self.set_status(format!("已请求取消传输 #{}", id), false);
+        } else {
+            self.set_status("传输已结束或无法取消", true);
+        }
+    }
+
+    fn move_selection(&mut self, delta: isize) {
+        match self.focus {
+            Focus::Local => {
+                let len = self.local.visible_len();
+                self.local.selected = step(self.local.selected, delta, len);
+            }
+            Focus::Remote => {
+                let len = self.remote.visible_len();
+                self.remote.selected = step(self.remote.selected, delta, len);
+            }
+            Focus::Transfers => {
+                let len = self.transfers.len();
+                self.transfer_selected = step(self.transfer_selected, delta, len);
+            }
+        }
+    }
+
+    fn select_first(&mut self) {
+        match self.focus {
+            Focus::Local => self.local.selected = 0,
+            Focus::Remote => self.remote.selected = 0,
+            Focus::Transfers => self.transfer_selected = 0,
+        }
+    }
+
+    fn select_last(&mut self) {
+        match self.focus {
+            Focus::Local => {
+                self.local.selected = self.local.visible_len().saturating_sub(1);
+            }
+            Focus::Remote => {
+                self.remote.selected = self.remote.visible_len().saturating_sub(1);
+            }
+            Focus::Transfers => {
+                self.transfer_selected = self.transfers.len().saturating_sub(1);
+            }
+        }
+    }
+
+    fn enter(&mut self) {
+        match self.focus {
+            Focus::Local => {
+                let Some(entry) = self.local.current().cloned() else {
+                    return;
+                };
+                if entry.is_dir {
+                    self.navigate_local(entry.path);
+                } else {
+                    self.upload_paths(vec![entry.path]);
+                }
+            }
+            Focus::Remote => {
+                let Some(item) = self.remote.current().cloned() else {
+                    return;
+                };
+                if item.is_dir {
+                    self.navigate_remote(item.absolute_path(&self.remote.cwd));
+                } else {
+                    self.download_selected();
+                }
+            }
+            Focus::Transfers => self.cancel_selected_transfer(),
+        }
+    }
+
+    fn upload_paths(&mut self, paths: Vec<PathBuf>) {
+        let options = UploadOptions {
+            chunk_mib: self.config.file.transfer.upload_chunk_mib,
+            retries: self.config.file.transfer.retries,
+        };
+        let dest = self.remote.cwd.clone();
+        for path in paths {
+            self.enqueue_upload(path, dest.clone(), options.clone());
+        }
+    }
+
+    fn go_parent(&mut self) {
+        match self.focus {
+            Focus::Local => {
+                if let Some(parent) = self.local.parent() {
+                    self.navigate_local(parent);
+                }
+            }
+            Focus::Remote => {
+                if matches!(self.remote.mode, RemoteMode::Search { .. }) {
+                    self.clear_search();
+                    return;
+                }
+                if self.remote.cwd != "/" {
+                    let parent = remote_parent(&self.remote.cwd);
+                    self.navigate_remote(parent);
+                }
+            }
+            Focus::Transfers => {}
+        }
+    }
+
+    fn navigate_local(&mut self, path: PathBuf) {
+        if !path.is_dir() {
+            self.set_status(format!("不是目录: {}", path.display()), true);
+            return;
+        }
+        self.local.cwd = path;
+        self.local.filter.clear();
+        self.local.selected = 0;
+        self.marked_local.clear();
+        self.local.reload();
+    }
+
+    pub fn navigate_remote(&mut self, path: String) {
+        self.remote.cwd = normalize_remote(&path);
+        self.remote.mode = RemoteMode::Browse;
+        self.remote.filter.clear();
+        self.remote.selected = 0;
+        self.remote.entries.clear();
+        self.marked_remote.clear();
+        self.config.file.last_remote_dir = self.remote.cwd.clone();
+        self.dirty_config = true;
+        self.load_remote();
+    }
+
+    fn clear_search(&mut self) {
+        if matches!(self.remote.mode, RemoteMode::Search { .. }) {
+            let cwd = self.remote.cwd.clone();
+            self.remote.mode = RemoteMode::Browse;
+            self.remote.filter.clear();
+            self.remote.selected = 0;
+            self.remote.cwd = cwd;
+            self.load_remote();
+            self.set_status("已退出搜索结果", false);
+        } else if !self.remote.filter.is_empty() {
+            self.remote.filter.clear();
+            self.remote.clamp_selection();
+        } else if !self.local.filter.is_empty() {
+            self.local.filter.clear();
+            self.local.clamp_selection();
+        }
+    }
+
+    fn refresh_focused(&mut self) {
+        match self.focus {
+            Focus::Local => {
+                self.local.reload();
+                self.set_status("本地目录已刷新", false);
+            }
+            Focus::Remote | Focus::Transfers => self.refresh_remote(),
+        }
+    }
+
+    pub fn refresh_remote(&mut self) {
+        match self.remote.mode.clone() {
+            RemoteMode::Browse => self.load_remote(),
+            RemoteMode::Search { keyword, base } => self.load_search(keyword, base),
+        }
+    }
+
+    fn load_remote(&mut self) {
+        self.remote.loading = true;
+        self.remote.error = None;
+        self.generation += 1;
+        let generation = self.generation;
+        let cwd = self.remote.cwd.clone();
+        let client = self.client.clone();
+        let tx = self.tx.clone();
+        tokio::spawn(async move {
+            let result = client.list_dir(&cwd).await;
+            let (items, error) = match result {
+                Ok(items) => (items, None),
+                Err(err) => (Vec::new(), Some(err.to_string())),
+            };
+            let _ = tx.send(AppEvent::RemoteLoaded {
+                generation,
+                items,
+                error,
+            });
+        });
+    }
+
+    fn load_search(&mut self, keyword: String, base: String) {
+        self.remote.loading = true;
+        self.remote.error = None;
+        self.generation += 1;
+        let generation = self.generation;
+        let client = self.client.clone();
+        let tx = self.tx.clone();
+        tokio::spawn(async move {
+            let result = client.search(&keyword, &base, true).await;
+            let (items, error) = match result {
+                Ok(items) => (items, None),
+                Err(err) => (Vec::new(), Some(err.to_string())),
+            };
+            let _ = tx.send(AppEvent::SearchLoaded {
+                generation,
+                keyword,
+                base,
+                items,
+                error,
+            });
+        });
+    }
+
+    fn load_quota(&mut self) {
+        let client = self.client.clone();
+        let tx = self.tx.clone();
+        tokio::spawn(async move {
+            let result = client.quota().await.map_err(|err| err.to_string());
+            let _ = tx.send(AppEvent::Quota(result));
+        });
+    }
+
+    fn load_user(&mut self) {
+        let client = self.client.clone();
+        let tx = self.tx.clone();
+        tokio::spawn(async move {
+            let result = client.whoami().await.map_err(|err| err.to_string());
+            let _ = tx.send(AppEvent::User(result));
+        });
+    }
+
+    fn open_local(&mut self) {
+        let Some(entry) = self.local.current().cloned() else {
+            return;
+        };
+        if entry.is_dir {
+            self.navigate_local(entry.path);
+            return;
+        }
+        match std::process::Command::new("xdg-open")
+            .arg(&entry.path)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+        {
+            Ok(_) => self.set_status(format!("已打开: {}", entry.name), false),
+            Err(err) => self.set_status(format!("打开失败: {err}"), true),
+        }
+    }
+
+    fn request_quit(&mut self) {
+        if self.engine.active_count() > 0 {
+            self.confirm = Some(ConfirmState {
+                title: "退出 pcstui".to_string(),
+                message: format!(
+                    "仍有 {} 个传输任务在运行，退出会取消它们。确定退出？",
+                    self.engine.active_count()
+                ),
+                action: ConfirmAction::Quit,
+            });
+        } else {
+            self.should_quit = true;
+        }
+    }
+
+    fn set_status(&mut self, text: impl Into<String>, error: bool) {
+        self.status = StatusMessage::new(text, error);
+    }
+
+    pub fn quota_line(&self) -> String {
+        match &self.quota {
+            Some(quota) => format!(
+                "{} / {}（{:.0}%）",
+                format_bytes(quota.used),
+                format_bytes(quota.total),
+                quota.used_ratio() * 100.0
+            ),
+            None => "容量查询中…".to_string(),
+        }
+    }
+
+    pub fn account_name(&self) -> String {
+        if let Some(user) = &self.user {
+            return user.best_name().to_string();
+        }
+        match &self.config.file.account {
+            Some(account) => account.display_name().to_string(),
+            None => "未登录".to_string(),
+        }
+    }
+}
+
+fn completion_target(value: &str, cwd: &str) -> (String, String) {
+    let value = value.trim();
+    if value.is_empty() {
+        return (cwd.to_string(), String::new());
+    }
+    let absolute = value.starts_with('/');
+    let ends_slash = value.ends_with('/');
+    let normalized = if absolute {
+        normalize_remote(value)
+    } else {
+        remote_join(cwd, value)
+    };
+    if ends_slash {
+        return (normalized, String::new());
+    }
+    let parent = remote_parent(&normalized);
+    let prefix = normalized.rsplit('/').next().unwrap_or("").to_string();
+    (parent, prefix)
+}
+
+fn join_completed(parent: &str, completed: &str) -> String {
+    let trailing = completed.ends_with('/');
+    let mut value = remote_join(parent, completed);
+    if trailing && !value.ends_with('/') {
+        value.push('/');
+    }
+    value
+}
+
+fn render_completed_path(cwd: &str, parent: &str, completed: &str, absolute_input: bool) -> String {
+    if absolute_input {
+        return join_completed(parent, completed);
+    }
+    if parent == cwd {
+        return completed.to_string();
+    }
+    let cwd = cwd.trim_end_matches('/');
+    if cwd.is_empty() {
+        return join_completed(parent, completed);
+    }
+    let prefix = format!("{cwd}/");
+    if let Some(rest) = parent.strip_prefix(&prefix) {
+        if rest.is_empty() {
+            completed.to_string()
+        } else {
+            format!("{rest}/{completed}")
+        }
+    } else {
+        join_completed(parent, completed)
+    }
+}
+
+fn common_prefix(values: &[&str]) -> String {
+    let mut iter = values.iter();
+    let Some(first) = iter.next() else {
+        return String::new();
+    };
+    let mut prefix = first.chars().collect::<Vec<_>>();
+    for value in iter {
+        let chars = value.chars().collect::<Vec<_>>();
+        let mut len = 0;
+        while len < prefix.len() && len < chars.len() && prefix[len] == chars[len] {
+            len += 1;
+        }
+        prefix.truncate(len);
+        if prefix.is_empty() {
+            break;
+        }
+    }
+    prefix.into_iter().collect()
+}
+
+fn step(current: usize, delta: isize, len: usize) -> usize {
+    if len == 0 {
+        return 0;
+    }
+    let next = current as isize + delta;
+    next.clamp(0, len as isize - 1) as usize
+}
+
+/// Small helper shared with tests: a name is safe for local creation if it
+/// does not escape the current directory.
+pub fn safe_name(name: &str) -> String {
+    sanitize_component(name)
+}
+
+pub fn local_time(time: Option<SystemTime>) -> String {
+    let Some(time) = time else {
+        return "-".to_string();
+    };
+    let datetime: chrono::DateTime<chrono::Local> = time.into();
+    datetime.format("%Y-%m-%d %H:%M").to_string()
+}
+
+pub fn transfer_summary(transfers: &[TransferProgress]) -> String {
+    let active = transfers
+        .iter()
+        .filter(|transfer| !transfer.status.is_terminal())
+        .count();
+    if active == 0 {
+        format!("{} 项", transfers.len())
+    } else {
+        format!("{active} 进行中 / {} 项", transfers.len())
+    }
+}
+
+/// Used by the TUI status line and tests.
+pub fn parse_input_path(value: &str, cwd: &str) -> Result<String> {
+    let value = value.trim();
+    if value.is_empty() {
+        bail!("路径不能为空");
+    }
+    if value.starts_with('/') {
+        Ok(normalize_remote(value))
+    } else {
+        Ok(remote_join(cwd, value))
+    }
+}
+
+pub fn ensure_local_parent(path: &Path) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("创建本地目录失败: {}", parent.display()))?;
+    }
+    Ok(())
+}
+
+pub fn display_error(err: &anyhow::Error) -> String {
+    format!("{err:#}")
+}
+
+pub fn empty_dir_message() -> &'static str {
+    "（空目录）"
+}
+
+pub fn require_path(value: &str) -> Result<&str> {
+    let value = value.trim();
+    if value.is_empty() {
+        Err(anyhow!("路径不能为空"))
+    } else {
+        Ok(value)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn step_clamps() {
+        assert_eq!(step(0, -1, 5), 0);
+        assert_eq!(step(4, 10, 5), 4);
+        assert_eq!(step(0, 0, 0), 0);
+    }
+
+    #[test]
+    fn parses_input_paths() {
+        assert_eq!(parse_input_path("sub", "/apps").unwrap(), "/apps/sub");
+        assert_eq!(parse_input_path("/root", "/apps").unwrap(), "/root");
+        assert!(parse_input_path("  ", "/apps").is_err());
+    }
+
+    #[test]
+    fn input_cursor_supports_unicode_editing() {
+        let mut input = InputState::new(
+            "t",
+            "p",
+            "远程文件.txt".to_string(),
+            InputKind::Rename {
+                from: "/远程文件.txt".to_string(),
+            },
+        );
+        assert_eq!(input.cursor, 8);
+        input.move_left();
+        input.backspace();
+        assert_eq!(input.value, "远程文件.tt");
+        input.insert('X');
+        assert_eq!(input.value, "远程文件.tXt");
+        input.home();
+        input.delete();
+        assert_eq!(input.value, "程文件.tXt");
+        input.end();
+        input.insert('!');
+        assert_eq!(input.value, "程文件.tXt!");
+        input.move_word_left();
+        assert_eq!(input.cursor, 0);
+        input.delete_to_end();
+        assert_eq!(input.value, "");
+    }
+
+    #[test]
+    fn input_word_deletion_handles_spaces() {
+        let mut input = InputState::new("t", "p", "alpha beta".to_string(), InputKind::Goto);
+        input.delete_word_left();
+        assert_eq!(input.value, "alpha ");
+        input.delete_word_left();
+        assert_eq!(input.value, "");
+    }
+
+    #[test]
+    fn completion_targets_and_paths() {
+        assert_eq!(
+            completion_target("/apps/bypy/fi", "/"),
+            ("/apps/bypy".to_string(), "fi".to_string())
+        );
+        assert_eq!(
+            completion_target("fi", "/apps"),
+            ("/apps".to_string(), "fi".to_string())
+        );
+        assert_eq!(
+            completion_target("/apps/", "/"),
+            ("/apps".to_string(), String::new())
+        );
+        assert_eq!(
+            completion_target("", "/apps"),
+            ("/apps".to_string(), String::new())
+        );
+        assert_eq!(
+            render_completed_path("/apps", "/apps", "foo/", false),
+            "foo/"
+        );
+        assert_eq!(
+            render_completed_path("/apps", "/apps/bypy", "foo/", false),
+            "bypy/foo/"
+        );
+        assert_eq!(
+            render_completed_path("/apps", "/other", "foo/", false),
+            "/other/foo/"
+        );
+        assert_eq!(common_prefix(&["foo", "foobar", "fob"]), "fo");
+        assert_eq!(common_prefix(&["远程", "远程文件"]), "远程");
+    }
+
+    #[test]
+    fn local_pane_filters_hidden() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("visible.txt"), b"x").unwrap();
+        std::fs::write(dir.path().join(".hidden"), b"x").unwrap();
+        let mut pane = LocalPane::new(dir.path().to_path_buf());
+        pane.reload();
+        assert_eq!(pane.visible_len(), 1);
+        pane.show_hidden = true;
+        assert_eq!(pane.visible_len(), 2);
+    }
+}

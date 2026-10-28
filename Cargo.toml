@@ -1,0 +1,46 @@
+[package]
+name = "pcstui"
+version = "0.1.0"
+edition = "2024"
+description = "Native Rust Baidu Netdisk TUI — no external Go binary required"
+license = "Apache-2.0"
+rust-version = "1.85"
+
+[[bin]]
+name = "pcstui"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1"
+base64 = "0.22"
+bytes = "1"
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+clap = { version = "4.5", features = ["derive", "env"] }
+crc32fast = "1"
+crossterm = { version = "0.28", features = ["event-stream"] }
+filetime = "0.2"
+futures = "0.3"
+hex = "0.4"
+md-5 = "0.10"
+ratatui = "0.29"
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "stream", "multipart", "gzip"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha1 = "0.10"
+thiserror = "2"
+tokio = { version = "1", features = ["full"] }
+tokio-util = { version = "0.7", features = ["io", "rt"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+unicode-width = "0.2"
+url = "2"
+uuid = { version = "1", features = ["v4", "serde"] }
+walkdir = "2"
+
+[dev-dependencies]
+tempfile = "3"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = true
