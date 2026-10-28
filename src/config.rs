@@ -4,7 +4,7 @@ use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, anyhow, bail};
 use serde::{Deserialize, Serialize};
 
 pub const DEFAULT_APP_ID: u32 = 266_719;
@@ -237,11 +237,41 @@ impl Default for ConfigFile {
 impl ConfigFile {
     /// Read a saved `pcstui.json`. This is the portable import format; no
     /// external application or other project directory is consulted.
+    ///
+    /// pcstui deliberately does not decrypt credentials. Encrypted or
+    /// compressed files are rejected with an actionable message instead of a
+    /// generic JSON parse error.
     pub fn read(path: &Path) -> Result<Self> {
-        let raw = fs::read_to_string(path)
-            .with_context(|| format!("读取配置失败: {}", path.display()))?;
-        let file: Self = serde_json::from_str(&raw)
-            .with_context(|| format!("解析配置失败: {}", path.display()))?;
+        let bytes = fs::read(path).with_context(|| format!("读取配置失败: {}", path.display()))?;
+        let raw = match String::from_utf8(bytes) {
+            Ok(raw) => raw,
+            Err(_) => bail!(
+                "配置文件不是文本 JSON（可能是加密或压缩的二进制文件）：{}；请先解密为明文 pcstui.json 后再导入",
+                path.display()
+            ),
+        };
+        Self::parse(&raw).map_err(|err| anyhow!("读取配置失败: {}: {err:#}", path.display()))
+    }
+
+    fn parse(raw: &str) -> Result<Self> {
+        let text = raw.trim_start_matches('\u{feff}');
+        let trimmed = text.trim_start();
+        if is_encrypted_or_compressed(trimmed) {
+            bail!(
+                "配置文件不是明文 pcstui JSON（检测到加密或压缩内容）；请先使用 age/gpg 等工具解密为 pcstui.json 后再导入。pcstui 不保存密码，也不执行解密"
+            );
+        }
+        let file: Self = match serde_json::from_str(text) {
+            Ok(file) => file,
+            Err(err) => {
+                if !trimmed.starts_with('{') {
+                    bail!(
+                        "配置文件不是 pcstui JSON（可能已加密、压缩或不是配置文件）；请先解密为明文 JSON 后再导入"
+                    );
+                }
+                return Err(err).context("解析配置失败");
+            }
+        };
         Ok(file.normalized())
     }
 
@@ -269,9 +299,7 @@ impl ConfigFile {
             Some(_) => {
                 bail!("配置中的账号凭据不完整（BDUSS/STOKEN 为空）：请运行 `pcstui login` 重新登录")
             }
-            None => bail!(
-                "尚未配置账号：可在 TUI 登录页登录，或运行 `pcstui login --bduss <BDUSS> --stoken <STOKEN>`；也可用 `pcstui login --from-config <FILE>` 导入已保存的配置"
-            ),
+            None => bail!("尚未配置账号：启动 TUI 会进入登录页；也可运行 `pcstui login` 交互登录"),
         }
     }
 }
@@ -340,10 +368,27 @@ impl RuntimeConfig {
         write_config_file(&self.paths.config_file, &self.file, true)
     }
 
+    /// Save the active config after copying the existing file to a private
+    /// timestamped backup. Used by login and import so a rejected or mistaken
+    /// replacement never destroys the previous credentials.
+    pub fn save_with_backup(&self) -> Result<Option<PathBuf>> {
+        let backup = if self.paths.config_file.is_file() {
+            Some(backup_config_file(&self.paths.config_file)?)
+        } else {
+            None
+        };
+        self.save()?;
+        Ok(backup)
+    }
+
     /// Write a portable copy of the current config. The default keeps the
     /// account so the file can be copied to another machine; `redacted`
     /// removes credentials for safe sharing.
     pub fn export_to(&self, path: &Path, redacted: bool) -> Result<()> {
+        let path = expand_tilde(path);
+        if same_path(&path, &self.paths.config_file) {
+            bail!("导出路径不能是当前配置文件；请换一个路径");
+        }
         let mut file = self.file.clone().normalized();
         if let Some(dir) = file.download_dir.take() {
             // Relative paths keep working after the folder is copied.
@@ -355,7 +400,7 @@ impl RuntimeConfig {
         if redacted {
             file.account = None;
         }
-        write_config_file(path, &file, false)
+        write_new_config_file(&path, &file)
     }
 
     /// Load another machine's config into memory without saving. The caller
@@ -379,9 +424,10 @@ impl RuntimeConfig {
 
     /// Import a saved `pcstui.json` from another machine or backup. This is
     /// the portable path: the file contains the account and all settings.
+    /// The existing config is backed up before replacement.
     pub fn import_from(&mut self, path: &Path) -> Result<()> {
         self.adopt_file(path)?;
-        self.save()
+        self.save_with_backup().map(|_| ())
     }
 
     pub fn set_account(&mut self, account: Account) {
@@ -391,7 +437,7 @@ impl RuntimeConfig {
     pub fn redacted_summary(&self) -> String {
         match &self.file.account {
             Some(account) => format!(
-                "{} (uid={}, BDUSS={}…, STOKEN={}…)",
+                "{} (uid={}, BDUSS={}, STOKEN={})",
                 account.display_name(),
                 account.uid,
                 mask(&account.bduss),
@@ -436,6 +482,93 @@ fn write_config_file(path: &Path, file: &ConfigFile, private_dir: bool) -> Resul
     set_file_private(&tmp);
     fs::rename(&tmp, path).with_context(|| format!("替换配置失败: {}", path.display()))?;
     Ok(())
+}
+
+/// Write an export without ever replacing an existing file. Unlike the active
+/// config store, exports do not need atomic replacement: `create_new` is the
+/// important guarantee, so a typo can never clobber a real config or backup.
+fn write_new_config_file(path: &Path, file: &ConfigFile) -> Result<()> {
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    fs::create_dir_all(parent)
+        .with_context(|| format!("创建导出目录失败: {}", parent.display()))?;
+    let data = serde_json::to_vec_pretty(file)?;
+    let mut options = fs::OpenOptions::new();
+    options.create_new(true).write(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut handle = options.open(path).with_context(|| {
+        format!(
+            "创建导出文件失败: {}（目标已存在或无权写入）",
+            path.display()
+        )
+    })?;
+    handle.write_all(&data)?;
+    handle.write_all(b"\n")?;
+    handle.sync_all()?;
+    set_file_private(path);
+    Ok(())
+}
+
+/// Reject common encrypted/compressed containers before serde produces a
+/// confusing parse error. This is a heuristic, not decryption support.
+fn is_encrypted_or_compressed(text: &str) -> bool {
+    text.starts_with("-----BEGIN PGP MESSAGE-----")
+        || text.starts_with("-----BEGIN AGE ENCRYPTED FILE-----")
+        || text.starts_with("age-encryption.org/")
+        || text.starts_with("Salted__")
+        || text.starts_with("-----BEGIN ENCRYPTED")
+        || text.starts_with("\u{1f}\u{8b}") // gzip magic
+        || text.starts_with("PK\u{3}\u{4}") // zip magic
+        || text.starts_with("7z\u{bc}\u{af}\u{27}\u{1c}") // 7z magic
+}
+
+fn same_path(a: &Path, b: &Path) -> bool {
+    match (fs::canonicalize(a), fs::canonicalize(b)) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => a == b,
+    }
+}
+
+/// Copy the existing config to a private, timestamped sibling. `create_new`
+/// guarantees that a backup is never overwritten.
+fn backup_config_file(path: &Path) -> Result<PathBuf> {
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("pcstui.json");
+    let stamp = chrono::Local::now().format("%Y%m%d-%H%M%S");
+    let mut candidate = parent.join(format!("{name}.bak-{stamp}"));
+    let mut suffix = 1_u32;
+    while candidate.exists() {
+        candidate = parent.join(format!("{name}.bak-{stamp}.{suffix}"));
+        suffix += 1;
+    }
+    let data =
+        fs::read(path).with_context(|| format!("读取当前配置以备份失败: {}", path.display()))?;
+    let mut options = fs::OpenOptions::new();
+    options.create_new(true).write(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut handle = options
+        .open(&candidate)
+        .with_context(|| format!("创建配置备份失败: {}", candidate.display()))?;
+    handle.write_all(&data)?;
+    handle.sync_all()?;
+    set_file_private(&candidate);
+    Ok(candidate)
 }
 
 /// Trim a pasted credential and reject accidental cookie syntax in a single
@@ -712,5 +845,126 @@ mod tests {
         assert_eq!(mask("abcdefghijklmnop"), "abcd…mnop");
         assert_eq!(mask("short"), "***");
         assert_eq!(mask("一二三四五六七八九十"), "一二三四…七八九十");
+    }
+
+    fn account(bduss: &str) -> Account {
+        Account {
+            uid: 42,
+            name: "tester".to_string(),
+            bduss: bduss.to_string(),
+            stoken: "STOKEN_SECRET_5678".to_string(),
+            baiduid: String::new(),
+            access_token: String::new(),
+        }
+    }
+
+    #[test]
+    fn encrypted_or_binary_config_is_rejected_with_actionable_message() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("pcstui.json");
+        fs::write(
+            &path,
+            "-----BEGIN PGP MESSAGE-----\nnot a pcstui config\n-----END PGP MESSAGE-----\n",
+        )
+        .unwrap();
+        let err = ConfigFile::read(&path).unwrap_err().to_string();
+        assert!(err.contains("解密"), "unexpected error: {err}");
+
+        fs::write(&path, [0xff, 0xfe, 0x00, 0x01]).unwrap();
+        let err = ConfigFile::read(&path).unwrap_err().to_string();
+        assert!(err.contains("文本 JSON"), "unexpected error: {err}");
+
+        fs::write(&path, "not json at all").unwrap();
+        let err = ConfigFile::read(&path).unwrap_err().to_string();
+        assert!(err.contains("不是 pcstui JSON"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn save_with_backup_preserves_previous_credentials() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = test_paths(dir.path());
+        let mut config = RuntimeConfig {
+            paths: paths.clone(),
+            file: ConfigFile::default(),
+        };
+        config.set_account(account("OLD_BDUSS_1234"));
+        config.save().unwrap();
+
+        config.set_account(account("NEW_BDUSS_5678"));
+        let backup = config.save_with_backup().unwrap().expect("backup path");
+        let old = ConfigFile::read(&backup).unwrap();
+        assert_eq!(old.account.as_ref().unwrap().bduss, "OLD_BDUSS_1234");
+        let active = ConfigFile::read(&paths.config_file).unwrap();
+        assert_eq!(active.account.as_ref().unwrap().bduss, "NEW_BDUSS_5678");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = fs::metadata(&backup).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600);
+        }
+    }
+
+    #[test]
+    fn export_cannot_replace_active_config() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = test_paths(dir.path());
+        let config = RuntimeConfig {
+            paths: paths.clone(),
+            file: ConfigFile::default(),
+        };
+        config.save().unwrap();
+        let err = config
+            .export_to(&paths.config_file, true)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("当前配置文件"), "unexpected error: {err}");
+        // The active config is still readable after the rejected export.
+        ConfigFile::read(&paths.config_file).unwrap();
+    }
+
+    #[test]
+    fn export_refuses_existing_destination() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = RuntimeConfig {
+            paths: test_paths(dir.path()),
+            file: ConfigFile::default(),
+        };
+        let export = dir.path().join("existing.json");
+        fs::write(&export, b"do not overwrite").unwrap();
+        assert!(config.export_to(&export, true).is_err());
+        assert_eq!(fs::read(&export).unwrap(), b"do not overwrite");
+    }
+
+    #[test]
+    fn import_from_backs_up_existing_config() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = tempfile::tempdir().unwrap();
+        let source_path = source.path().join("portable.json");
+        let mut source_file = ConfigFile::default();
+        source_file.account = Some(account("IMPORTED_BDUSS"));
+        write_config_file(&source_path, &source_file, false).unwrap();
+
+        let paths = test_paths(dir.path());
+        let mut config = RuntimeConfig {
+            paths: paths.clone(),
+            file: ConfigFile::default(),
+        };
+        config.set_account(account("LOCAL_BDUSS"));
+        config.save().unwrap();
+
+        config.import_from(&source_path).unwrap();
+        let active = ConfigFile::read(&paths.config_file).unwrap();
+        assert_eq!(active.account.as_ref().unwrap().bduss, "IMPORTED_BDUSS");
+        let backups = fs::read_dir(dir.path().join("config"))
+            .unwrap()
+            .filter_map(|entry| entry.ok())
+            .filter(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with("pcstui.json.bak-")
+            })
+            .count();
+        assert_eq!(backups, 1);
     }
 }

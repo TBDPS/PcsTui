@@ -221,7 +221,7 @@ pub async fn run(cli: Cli) -> Result<()> {
             uid,
             name,
         } => login(config, from_config, cookie, bduss, stoken, uid, name).await,
-        Command::Config { action } => config_command(config, action),
+        Command::Config { action } => config_command(config, action).await,
     }
 }
 
@@ -552,10 +552,27 @@ async fn login(
 ) -> Result<()> {
     if let Some(path) = from_config {
         let path = expand_tilde(&path);
-        config.import_from(&path)?;
+        // Adopt in memory first: a failed online check must not replace the
+        // working credentials.
+        config.adopt_file(&path)?;
+        let client = client(&config)?;
+        let user = client
+            .whoami()
+            .await
+            .map_err(|err| anyhow!("导入配置在线验证失败: {err}"))?;
+        if let Some(account) = config.file.account.as_mut() {
+            account.uid = user.uk;
+            if account.name.is_empty() {
+                account.name = user.best_name().to_string();
+            }
+        }
+        let backup = config.save_with_backup()?;
         println!("已导入配置: {}", path.display());
         println!("{}", config.redacted_summary());
-        return verify_login(config).await;
+        if let Some(backup) = backup {
+            println!("旧配置已备份: {}", backup.display());
+        }
+        return Ok(());
     }
 
     let interactive_tui = cookie.is_none()
@@ -705,7 +722,7 @@ fn same_file(a: &Path, b: &Path) -> bool {
     }
 }
 
-fn config_command(config: RuntimeConfig, action: ConfigAction) -> Result<()> {
+async fn config_command(config: RuntimeConfig, action: ConfigAction) -> Result<()> {
     match action {
         ConfigAction::Show => {
             println!(
@@ -758,7 +775,7 @@ fn config_command(config: RuntimeConfig, action: ConfigAction) -> Result<()> {
                 println!("已移除账号凭据，可直接分享或作为模板。");
             } else {
                 println!(
-                    "包含账号凭据，请按 0600 权限保管；拷贝到其他机器后用 `pcstui login --from-config` 导入。"
+                    "包含账号凭据，请按 0600 权限保管；需要加密时请自行使用 age/gpg。换机后可在 TUI 配置面板（C）导入。"
                 );
             }
             Ok(())
@@ -766,9 +783,26 @@ fn config_command(config: RuntimeConfig, action: ConfigAction) -> Result<()> {
         ConfigAction::Import { path } => {
             let path = expand_tilde(&path);
             let mut config = config;
-            config.import_from(&path)?;
+            // Validate before replacing: a bad file must leave the active
+            // config untouched. The old file is backed up on success.
+            config.adopt_file(&path)?;
+            let client = client(&config)?;
+            let user = client
+                .whoami()
+                .await
+                .map_err(|err| anyhow!("导入配置在线验证失败: {err}"))?;
+            if let Some(account) = config.file.account.as_mut() {
+                account.uid = user.uk;
+                if account.name.is_empty() {
+                    account.name = user.best_name().to_string();
+                }
+            }
+            let backup = config.save_with_backup()?;
             println!("已导入: {}", path.display());
             println!("{}", config.redacted_summary());
+            if let Some(backup) = backup {
+                println!("旧配置已备份: {}", backup.display());
+            }
             Ok(())
         }
         ConfigAction::SetDownloadDir { path } => {
@@ -837,9 +871,7 @@ async fn doctor(config: RuntimeConfig) -> Result<()> {
         if !config.paths.config_file.is_file() {
             println!("配置文件不存在：启动 TUI 会进入登录页，或运行 `pcstui login`");
         }
-        println!(
-            "账号: 未配置（运行 `pcstui login` 交互登录，或 `pcstui login --from-config <FILE>` 导入已保存配置）"
-        );
+        println!("账号: 未配置（启动 TUI 或运行 `pcstui login` 交互登录）");
         return Ok(());
     }
     println!("账号: {}", config.redacted_summary());

@@ -6,6 +6,7 @@ use ratatui::widgets::{Block, BorderType, Borders, Cell, Clear, Paragraph, Row, 
 
 use crate::api::models::{format_bytes, format_speed, format_timestamp};
 use crate::tui::app::{App, Focus, InputKind, RemoteMode, local_time, transfer_summary};
+use crate::tui::config_panel::ConfigPanel;
 
 const ACCENT: Color = Color::Rgb(90, 200, 250);
 const ACCENT_DIM: Color = Color::Rgb(45, 110, 140);
@@ -35,6 +36,9 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
 
     if app.help {
         draw_help(frame, area);
+    }
+    if let Some(panel) = &app.config_panel {
+        draw_config_panel(frame, area, app, panel);
     }
     if let Some(input) = &app.input {
         draw_input(frame, area, input);
@@ -440,6 +444,151 @@ fn draw_status(frame: &mut Frame, area: Rect, app: &App) {
     frame.render_widget(Paragraph::new(line2).style(bg), chunks[2]);
 }
 
+fn draw_config_panel(frame: &mut Frame, area: Rect, app: &App, panel: &ConfigPanel) {
+    let popup = centered_rect(90, 88, area);
+    frame.render_widget(Clear, popup);
+
+    let mut lines = vec![
+        Line::from(Span::styled(
+            " 配置与诊断 ",
+            Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+        )),
+        Line::from(""),
+        Line::from(vec![
+            Span::styled("账号    ", Style::default().fg(MUTED)),
+            Span::raw(app.config.redacted_summary()),
+        ]),
+        Line::from(vec![
+            Span::styled("版本    ", Style::default().fg(MUTED)),
+            Span::raw(format!("pcstui {}", crate::VERSION)),
+        ]),
+        Line::from(vec![
+            Span::styled("配置    ", Style::default().fg(MUTED)),
+            Span::raw(app.config.paths.config_file.display().to_string()),
+        ]),
+        Line::from(vec![
+            Span::styled("配置目录", Style::default().fg(MUTED)),
+            Span::raw(app.config.paths.config_dir.display().to_string()),
+        ]),
+        Line::from(vec![
+            Span::styled("下载目录", Style::default().fg(MUTED)),
+            Span::raw(app.config.download_dir().display().to_string()),
+        ]),
+        Line::from(vec![
+            Span::styled("队列    ", Style::default().fg(MUTED)),
+            Span::raw(app.config.paths.queue_file.display().to_string()),
+        ]),
+        Line::from(vec![
+            Span::styled("上传断点", Style::default().fg(MUTED)),
+            Span::raw(app.config.paths.upload_state_dir.display().to_string()),
+        ]),
+        Line::from(vec![
+            Span::styled("远程目录", Style::default().fg(MUTED)),
+            Span::raw(app.config.file.last_remote_dir.clone()),
+        ]),
+        Line::from(""),
+        Line::from(Span::styled(
+            "本地检查",
+            Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+        )),
+    ];
+    for check in &panel.checks {
+        let (mark, color) = if check.ok { ("✓", OK) } else { ("✗", ERR) };
+        lines.push(Line::from(vec![
+            Span::styled(format!(" {mark} "), Style::default().fg(color)),
+            Span::raw(check.label.clone()),
+            Span::styled(
+                if check.ok {
+                    String::new()
+                } else {
+                    format!("（{}）", check.hint)
+                },
+                Style::default().fg(WARN),
+            ),
+        ]));
+    }
+    let online = match &app.user {
+        Some(user) => format!("{} (uk={})", user.best_name(), user.uk),
+        None if app.config.has_account() => "查询中…".to_string(),
+        None => "未配置".to_string(),
+    };
+    let remote = if let Some(error) = &app.remote.error {
+        format!("异常：{error}")
+    } else if app.remote.loading {
+        "刷新中…".to_string()
+    } else {
+        format!("正常（{} 项）", app.remote.entries.len())
+    };
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        "在线检查",
+        Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+    )));
+    lines.push(Line::from(vec![
+        Span::styled(" 账号 ", Style::default().fg(MUTED)),
+        Span::raw(online),
+    ]));
+    lines.push(Line::from(vec![
+        Span::styled(" 容量 ", Style::default().fg(MUTED)),
+        Span::raw(app.quota_line()),
+    ]));
+    lines.push(Line::from(vec![
+        Span::styled(" 根目录 ", Style::default().fg(MUTED)),
+        Span::raw(remote),
+    ]));
+    lines.push(Line::from(vec![
+        Span::styled(" 活动传输 ", Style::default().fg(MUTED)),
+        Span::raw(app.engine.active_count().to_string()),
+    ]));
+
+    if let Some((message, error)) = &panel.message {
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled(
+            message.clone(),
+            Style::default().fg(if *error { ERR } else { OK }),
+        )));
+    }
+
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        "导出为明文 JSON；含凭据的导出不会加密，请用 age/gpg 自行加密保管。",
+        Style::default().fg(MUTED),
+    )));
+    lines.push(Line::from(Span::styled(
+        "导入会先在线验证账号并备份当前配置；加密文件请先解密为 pcstui.json。",
+        Style::default().fg(MUTED),
+    )));
+    lines.push(Line::from(""));
+    lines.push(Line::from(vec![
+        key("e"),
+        text(" 导出含凭据  "),
+        key("E"),
+        text(" 导出脱敏  "),
+        key("i"),
+        text(" 导入  "),
+        key("r"),
+        text(" 重新登录  "),
+        key("d"),
+        text(" 刷新  "),
+        key("q/Esc"),
+        text(" 关闭"),
+    ]));
+
+    frame.render_widget(
+        Paragraph::new(lines)
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .border_type(BorderType::Rounded)
+                    .border_style(Style::default().fg(ACCENT))
+                    .title(" 配置与诊断 "),
+            )
+            .wrap(Wrap { trim: false })
+            .style(Style::default().bg(Color::Rgb(20, 24, 28))),
+        popup,
+    );
+}
+
 fn draw_help(frame: &mut Frame, area: Rect) {
     let popup = centered_rect(78, 82, area);
     frame.render_widget(Clear, popup);
@@ -487,6 +636,10 @@ fn draw_help(frame: &mut Frame, area: Rect) {
         ]),
         Line::from(vec![key("r"), text("  刷新当前面板（本地/远程）")]),
         Line::from(vec![key("p"), text("  显示 / 隐藏传输队列")]),
+        Line::from(vec![
+            key("C"),
+            text("  配置与诊断（导出 / 导入 / 重新登录 / 检查）"),
+        ]),
         Line::from(vec![
             key("K"),
             text("  取消传输面板中选中的任务（仅传输面板）"),
@@ -539,6 +692,14 @@ fn draw_input(frame: &mut Frame, area: Rect, input: &crate::tui::app::InputState
         InputKind::Rename { .. } => "Tab 补全 · Enter 确认重命名 · Esc 取消",
         InputKind::MoveDest { .. } => "Tab 补全 · Enter 移动 · Esc 取消",
         InputKind::CopyDest { .. } => "Tab 补全 · Enter 复制 · Esc 取消",
+        InputKind::ExportConfig { redacted } => {
+            if redacted {
+                "Enter 导出脱敏配置 · Esc 取消"
+            } else {
+                "Enter 导出含凭据配置 · Esc 取消"
+            }
+        }
+        InputKind::ImportConfig => "Enter 读取并在线验证 · Esc 取消",
     };
     let cursor = input.cursor.min(input.value.chars().count());
     let before = input.value.chars().take(cursor).collect::<String>();

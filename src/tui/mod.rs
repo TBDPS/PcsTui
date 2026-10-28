@@ -1,4 +1,5 @@
 pub mod app;
+pub(crate) mod config_panel;
 pub(crate) mod login;
 pub mod ui;
 
@@ -33,19 +34,40 @@ pub async fn run(mut config: RuntimeConfig) -> Result<()> {
             None => return Ok(()),
         }
     }
-    let client = BaiduClient::new(&config).map_err(|err| anyhow!(err))?;
-    let (engine, mut transfer_rx) = TransferEngine::new(client.clone(), config.clone());
-    let (tx, mut rx) = mpsc::unbounded_channel();
-    let mut app = App::new(config, client, engine, tx);
-    app.start();
+    loop {
+        let client = BaiduClient::new(&config).map_err(|err| anyhow!(err))?;
+        let (engine, mut transfer_rx) = TransferEngine::new(client.clone(), config.clone());
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mut app = App::new(config.clone(), client, engine, tx);
+        app.start();
 
-    let mut terminal = init_terminal().context("初始化终端失败")?;
-    let result = event_loop(&mut terminal, &mut app, &mut rx, &mut transfer_rx).await;
-    app.engine.cancel_all();
-    app.save_if_dirty();
-    let restore = restore_terminal(&mut terminal);
-    restore?;
-    result
+        let mut terminal = init_terminal().context("初始化终端失败")?;
+        let result = event_loop(&mut terminal, &mut app, &mut rx, &mut transfer_rx).await;
+        app.engine.cancel_all();
+        app.save_if_dirty();
+        let restart = app.restart_requested;
+        let relogin = app.relogin_requested;
+        let next_config = app.config.clone();
+        let restore = restore_terminal(&mut terminal);
+        restore?;
+        result?;
+
+        if relogin {
+            // Rebuild the client and engine after the login screen saves the
+            // new credentials. Cancelling here leaves unfinished queue entries
+            // intact, so the rebuilt app resumes them.
+            match login::run(next_config.clone()).await? {
+                Some(updated) => config = updated,
+                None => config = next_config,
+            }
+            continue;
+        }
+        if restart {
+            config = next_config;
+            continue;
+        }
+        return Ok(());
+    }
 }
 
 async fn event_loop(
@@ -87,7 +109,7 @@ async fn event_loop(
             app.on_yazi_done(result);
         }
 
-        if app.should_quit {
+        if app.should_quit || app.restart_requested || app.relogin_requested {
             break;
         }
     }

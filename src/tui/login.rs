@@ -272,8 +272,8 @@ impl LoginApp {
                                 account.name = user.best_name().to_string();
                             }
                         }
-                        match config.save() {
-                            Ok(()) => LoginOutcome::Success(Box::new(config)),
+                        match config.save_with_backup() {
+                            Ok(_) => LoginOutcome::Success(Box::new(config)),
                             Err(err) => LoginOutcome::Error(format!("保存配置失败: {err:#}")),
                         }
                     }

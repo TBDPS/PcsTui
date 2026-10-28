@@ -12,11 +12,12 @@ use crate::api::models::{
     Quota, RemoteItem, SortMode, UserInfo, format_bytes, format_timestamp, normalize_remote,
     remote_join, remote_parent, sanitize_component,
 };
-use crate::config::RuntimeConfig;
+use crate::config::{RuntimeConfig, expand_tilde, home_dir};
 use crate::transfer::types::{
     Direction, DownloadOptions, TransferEvent, TransferProgress, TransferStatus, UploadOptions,
 };
 use crate::transfer::{QueueStore, QueuedTask, QueuedTaskKind, TransferEngine};
+use crate::tui::config_panel::ConfigPanel;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Focus {
@@ -71,6 +72,14 @@ pub enum AppEvent {
         prefix: String,
         items: Vec<RemoteItem>,
         error: Option<String>,
+    },
+    ConfigImportReady {
+        candidate: Box<RuntimeConfig>,
+        source: PathBuf,
+        summary: String,
+    },
+    ConfigImportFailed {
+        message: String,
     },
 }
 
@@ -347,6 +356,8 @@ pub enum InputKind {
     Rename { from: RemoteRef },
     MoveDest { sources: Vec<RemoteRef> },
     CopyDest { sources: Vec<RemoteRef> },
+    ExportConfig { redacted: bool },
+    ImportConfig,
 }
 
 pub struct InputState {
@@ -481,6 +492,11 @@ fn char_to_byte(value: &str, char_index: usize) -> usize {
 pub enum ConfirmAction {
     DeleteRemote(Vec<RemoteRef>),
     DeleteLocal(Vec<PathBuf>),
+    ImportConfig {
+        candidate: Box<RuntimeConfig>,
+        source: PathBuf,
+    },
+    Relogin,
     Quit,
 }
 
@@ -523,10 +539,13 @@ pub struct App {
     pub status: StatusMessage,
     pub input: Option<InputState>,
     pub confirm: Option<ConfirmState>,
+    pub config_panel: Option<ConfigPanel>,
     pub help: bool,
     pub marked_local: HashSet<PathBuf>,
     pub marked_remote: HashMap<String, RemoteRef>,
     pub should_quit: bool,
+    pub restart_requested: bool,
+    pub relogin_requested: bool,
     pub request_yazi: bool,
     pub dirty_config: bool,
     pub generation: u64,
@@ -576,10 +595,13 @@ impl App {
             status: StatusMessage::new("就绪 · Tab 切换 · ? 帮助", false),
             input: None,
             confirm: None,
+            config_panel: None,
             help: false,
             marked_local: HashSet::new(),
             marked_remote: HashMap::new(),
             should_quit: false,
+            restart_requested: false,
+            relogin_requested: false,
             request_yazi: false,
             dirty_config: false,
             generation: 0,
@@ -902,6 +924,35 @@ impl App {
                 }
                 self.apply_completions(&parent, &prefix, items);
             }
+            AppEvent::ConfigImportReady {
+                candidate,
+                source,
+                summary,
+            } => {
+                if self.config_panel.is_none() {
+                    self.set_status("导入验证已完成，但配置面板已关闭；未修改配置", false);
+                    return;
+                }
+                if let Some(panel) = self.config_panel.as_mut() {
+                    panel.busy = false;
+                    panel.set_message(format!("已验证导入账号: {summary}"), false);
+                }
+                self.confirm = Some(ConfirmState {
+                    title: "导入配置".to_string(),
+                    message: format!(
+                        "已验证账号：{summary}\n来源：{}\n导入会替换当前配置，并自动备份旧配置。确认导入？",
+                        source.display()
+                    ),
+                    action: ConfirmAction::ImportConfig { candidate, source },
+                });
+            }
+            AppEvent::ConfigImportFailed { message } => {
+                if let Some(panel) = self.config_panel.as_mut() {
+                    panel.busy = false;
+                    panel.set_message(message.clone(), true);
+                }
+                self.set_status(message, true);
+            }
         }
     }
 
@@ -985,6 +1036,10 @@ impl App {
             self.handle_input_key(key);
             return;
         }
+        if self.config_panel.is_some() {
+            self.handle_config_panel_key(key);
+            return;
+        }
         if let KeyCode::Char(ch) = key.code {
             if !key.modifiers.contains(KeyModifiers::CONTROL)
                 && !key.modifiers.contains(KeyModifiers::ALT)
@@ -1000,6 +1055,7 @@ impl App {
         match key.code {
             KeyCode::Char('q') => self.request_quit(),
             KeyCode::Char('?') => self.help = true,
+            KeyCode::Char('C') => self.open_config_panel(),
             KeyCode::Char('p') => {
                 self.show_transfers = !self.show_transfers;
                 if self.show_transfers {
@@ -1171,6 +1227,78 @@ impl App {
         self.set_status(format!("{action}仅在{expected}面板可用"), true);
     }
 
+    fn open_config_panel(&mut self) {
+        self.config_panel = Some(ConfigPanel::open(&self.config, self.queue_error.as_deref()));
+        self.set_status(
+            "配置与诊断 · e 导出 · E 脱敏导出 · i 导入 · r 重新登录 · d 刷新",
+            false,
+        );
+    }
+
+    fn handle_config_panel_key(&mut self, key: KeyEvent) {
+        let busy = self.config_panel.as_ref().is_some_and(|panel| panel.busy);
+        match key.code {
+            KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('C') => {
+                self.config_panel = None;
+                self.set_status("已关闭配置与诊断", false);
+            }
+            _ if busy => {
+                self.set_panel_message("正在验证导入配置，请稍候…", false);
+            }
+            KeyCode::Char('e') => {
+                let path = default_export_path(&self.config, false);
+                self.open_input(InputState::new(
+                    "导出配置（含凭据）",
+                    "导出为明文 JSON，包含账号凭据；请妥善保管",
+                    path.display().to_string(),
+                    InputKind::ExportConfig { redacted: false },
+                ));
+            }
+            KeyCode::Char('E') => {
+                let path = default_export_path(&self.config, true);
+                self.open_input(InputState::new(
+                    "导出配置（脱敏）",
+                    "导出为明文 JSON，不包含账号凭据，可安全分享",
+                    path.display().to_string(),
+                    InputKind::ExportConfig { redacted: true },
+                ));
+            }
+            KeyCode::Char('i') => {
+                self.open_input(InputState::new(
+                    "导入配置",
+                    "明文 pcstui.json 路径（导入前会在线验证账号）",
+                    String::new(),
+                    InputKind::ImportConfig,
+                ));
+            }
+            KeyCode::Char('r') => {
+                self.confirm = Some(ConfirmState {
+                    title: "重新登录".to_string(),
+                    message: "重新登录会重建客户端并停止当前传输；未完成任务会保留在队列中，重启后继续。确认？"
+                        .to_string(),
+                    action: ConfirmAction::Relogin,
+                });
+            }
+            KeyCode::Char('d') => {
+                if let Some(panel) = self.config_panel.as_mut() {
+                    panel.refresh_local(&self.config, self.queue_error.as_deref());
+                    panel.set_message("正在刷新在线诊断…", false);
+                }
+                self.load_user();
+                self.load_quota();
+                self.refresh_remote();
+                self.set_status("正在刷新配置与在线诊断…", false);
+            }
+            _ => {}
+        }
+    }
+
+    fn set_panel_message(&mut self, text: impl Into<String>, error: bool) {
+        if let Some(panel) = self.config_panel.as_mut() {
+            panel.set_message(text, error);
+        }
+    }
+
     fn handle_confirm_key(&mut self, key: KeyEvent) {
         match key.code {
             KeyCode::Char('y') | KeyCode::Char('Y') => {
@@ -1239,6 +1367,30 @@ impl App {
                 } else {
                     self.set_status(format!("部分删除失败: {}", errors.join("; ")), true);
                 }
+            }
+            ConfirmAction::ImportConfig { candidate, source } => {
+                match candidate.save_with_backup() {
+                    Ok(backup) => {
+                        self.config = *candidate;
+                        self.restart_requested = true;
+                        let backup = backup
+                            .map(|path| format!("，旧配置备份到 {}", path.display()))
+                            .unwrap_or_default();
+                        let message =
+                            format!("配置已导入（{}）{backup}，正在重启…", source.display());
+                        self.set_panel_message(message.clone(), false);
+                        self.set_status(message, false);
+                    }
+                    Err(err) => {
+                        let message = format!("导入配置失败，当前配置未替换: {err:#}");
+                        self.set_panel_message(message.clone(), true);
+                        self.set_status(message, true);
+                    }
+                }
+            }
+            ConfirmAction::Relogin => {
+                self.relogin_requested = true;
+                self.set_status("正在重新登录…", false);
             }
             ConfirmAction::Quit => {
                 self.should_quit = true;
@@ -1588,6 +1740,85 @@ impl App {
                     });
                 });
                 self.marked_remote.clear();
+            }
+            InputKind::ExportConfig { redacted } => {
+                let path = if value.is_empty() {
+                    default_export_path(&self.config, redacted)
+                } else {
+                    expand_tilde(Path::new(&value))
+                };
+                if path.exists() {
+                    let message = format!("导出目标已存在，请换一个路径: {}", path.display());
+                    self.set_panel_message(message.clone(), true);
+                    self.set_status(message, true);
+                    return;
+                }
+                match self.config.export_to(&path, redacted) {
+                    Ok(()) => {
+                        let message = if redacted {
+                            format!("已导出脱敏配置: {}", path.display())
+                        } else {
+                            format!(
+                                "已导出明文配置（含账号凭据）: {}；请妥善保管",
+                                path.display()
+                            )
+                        };
+                        self.set_panel_message(message.clone(), false);
+                        self.set_status(message, false);
+                    }
+                    Err(err) => {
+                        let message = format!("导出配置失败: {err:#}");
+                        self.set_panel_message(message.clone(), true);
+                        self.set_status(message, true);
+                    }
+                }
+            }
+            InputKind::ImportConfig => {
+                if value.is_empty() {
+                    return;
+                }
+                let path = expand_tilde(Path::new(&value));
+                let mut candidate = self.config.clone();
+                if let Err(err) = candidate.adopt_file(&path) {
+                    let message = format!("读取导入配置失败: {err:#}");
+                    self.set_panel_message(message.clone(), true);
+                    self.set_status(message, true);
+                    return;
+                }
+                if let Some(panel) = self.config_panel.as_mut() {
+                    panel.busy = true;
+                    panel.set_message("正在在线验证导入配置…", false);
+                }
+                self.set_status("正在在线验证导入配置…", false);
+                let tx = self.tx.clone();
+                tokio::spawn(async move {
+                    let result = async {
+                        let client = BaiduClient::new(&candidate).map_err(|err| err.to_string())?;
+                        let user = client.whoami().await.map_err(|err| err.to_string())?;
+                        if let Some(account) = candidate.file.account.as_mut() {
+                            account.uid = user.uk;
+                            if account.name.is_empty() {
+                                account.name = user.best_name().to_string();
+                            }
+                        }
+                        Ok::<String, String>(user.best_name().to_string())
+                    }
+                    .await;
+                    match result {
+                        Ok(summary) => {
+                            let _ = tx.send(AppEvent::ConfigImportReady {
+                                candidate: Box::new(candidate),
+                                source: path,
+                                summary,
+                            });
+                        }
+                        Err(message) => {
+                            let _ = tx.send(AppEvent::ConfigImportFailed {
+                                message: format!("导入配置在线验证失败: {message}"),
+                            });
+                        }
+                    }
+                });
             }
         }
     }
@@ -2130,6 +2361,22 @@ impl App {
     }
 }
 
+fn default_export_path(config: &RuntimeConfig, redacted: bool) -> PathBuf {
+    let stamp = chrono::Local::now().format("%Y%m%d-%H%M%S");
+    let name = if redacted {
+        format!("pcstui-redacted-{stamp}.json")
+    } else {
+        format!("pcstui-portable-{stamp}.json")
+    };
+    let home = home_dir();
+    let dir = if home == Path::new(".") {
+        config.paths.root.clone()
+    } else {
+        home
+    };
+    dir.join(name)
+}
+
 fn completion_target(value: &str, cwd: &str) -> (String, String) {
     let value = value.trim();
     if value.is_empty() {
@@ -2502,5 +2749,118 @@ mod tests {
         assert_eq!(pane.visible_len(), 1);
         pane.show_hidden = true;
         assert_eq!(pane.visible_len(), 2);
+    }
+
+    #[tokio::test]
+    async fn config_panel_scopes_keys_and_exports() {
+        let (mut app, _dir) = test_app();
+        app.focus = Focus::Remote;
+        app.remote.entries = vec![remote_item()];
+        app.remote.selected = 0;
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('C'), KeyModifiers::NONE));
+        assert!(app.config_panel.is_some());
+        // Destructive and focus shortcuts must not leak through the overlay.
+        for key in ['x', 'u', 'p', 'R'] {
+            app.handle_key(KeyEvent::new(KeyCode::Char(key), KeyModifiers::NONE));
+            assert!(app.confirm.is_none(), "{key} should be scoped");
+            assert!(app.input.is_none(), "{key} should be scoped");
+            assert!(!app.show_transfers, "{key} should be scoped");
+        }
+        assert!(app.transfers.is_empty());
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('e'), KeyModifiers::NONE));
+        assert!(matches!(
+            app.input.as_ref().map(|input| &input.kind),
+            Some(InputKind::ExportConfig { redacted: false })
+        ));
+        app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(app.input.is_none());
+        assert!(app.config_panel.is_some());
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE));
+        assert!(app.config_panel.is_none());
+        assert!(!app.should_quit);
+    }
+
+    #[test]
+    fn config_import_replaces_only_after_confirmation_and_backs_up() {
+        let (mut app, dir) = test_app();
+        app.config.save().unwrap();
+        let old = app.config.file.account.as_ref().unwrap().bduss.clone();
+
+        let candidate = |app: &App| {
+            let mut candidate = app.config.clone();
+            candidate.set_account(Account {
+                uid: 2,
+                name: "imported".to_string(),
+                bduss: "NEW_BDUSS".to_string(),
+                stoken: "NEW_STOKEN".to_string(),
+                baiduid: String::new(),
+                access_token: String::new(),
+            });
+            candidate
+        };
+        let source = dir.path().join("portable.json");
+
+        app.confirm = Some(ConfirmState {
+            title: "导入配置".to_string(),
+            message: "test".to_string(),
+            action: ConfirmAction::ImportConfig {
+                candidate: Box::new(candidate(&app)),
+                source: source.clone(),
+            },
+        });
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(!app.restart_requested);
+        assert_eq!(
+            ConfigFile::read(&app.config.paths.config_file)
+                .unwrap()
+                .account
+                .unwrap()
+                .bduss,
+            old
+        );
+
+        app.confirm = Some(ConfirmState {
+            title: "导入配置".to_string(),
+            message: "test".to_string(),
+            action: ConfirmAction::ImportConfig {
+                candidate: Box::new(candidate(&app)),
+                source,
+            },
+        });
+        app.handle_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE));
+        assert!(app.restart_requested);
+        let active = ConfigFile::read(&app.config.paths.config_file).unwrap();
+        assert_eq!(active.account.unwrap().bduss, "NEW_BDUSS");
+        let backups = std::fs::read_dir(dir.path().join("config"))
+            .unwrap()
+            .filter_map(|entry| entry.ok())
+            .filter(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with("pcstui.json.bak-")
+            })
+            .count();
+        assert_eq!(backups, 1);
+    }
+
+    #[test]
+    fn relogin_requires_explicit_confirmation() {
+        let (mut app, _dir) = test_app();
+        app.handle_key(KeyEvent::new(KeyCode::Char('C'), KeyModifiers::NONE));
+        app.handle_key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::NONE));
+        assert!(matches!(
+            app.confirm.as_ref().map(|confirm| &confirm.action),
+            Some(ConfirmAction::Relogin)
+        ));
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(!app.relogin_requested);
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::NONE));
+        app.handle_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE));
+        assert!(app.relogin_requested);
     }
 }

@@ -67,6 +67,7 @@ main → cli → tui → transfer → api → config
 | `src/transfer/mod.rs` | `TransferEngine`、任务 spawn、取消、事件通道 | 协议细节 |
 | `src/tui/mod.rs` | 终端初始化/恢复、首次登录入口、事件循环、Yazi 挂起 | 业务状态机 |
 | `src/tui/login.rs` | 首次登录/导入配置、掩码输入、在线验证 | 主界面状态 |
+| `src/tui/config_panel.rs` | 配置/诊断快照、本地权限与可写检查 | 网络请求、绘制 |
 | `src/tui/app.rs` | 面板状态、键位、对话框、任务派发 | 绘制细节 |
 | `src/tui/ui.rs` | 布局、表格、进度条、浮层 | 网络/磁盘 I/O |
 | `src/cli.rs` | 子命令、参数校验、无头输出 | TUI 状态 |
@@ -94,19 +95,26 @@ main()
 
 ```text
 tui::run(config)
-  ├─ account 为空 → login::run(config)（掩码输入/导入 + 在线验证）
-  ├─ BaiduClient::new(config)
-  ├─ TransferEngine::new(client, config) → (engine, transfer_rx)
-  ├─ App::new(...)
-  ├─ App::start()
-  │    ├─ load_remote()  → tokio::spawn(list_dir) → AppEvent::RemoteLoaded
-  │    ├─ load_quota()   → AppEvent::Quota
-  │    ├─ load_user()    → AppEvent::User
-  │    └─ resume_queue() → 重新 spawn config/queue.json 中未完成的任务
   ├─ install_panic_hook()
-  ├─ init_terminal()（raw mode + alternate screen）
-  └─ event_loop(...)
+  ├─ account 为空 → login::run(config)（掩码输入/导入 + 在线验证）
+  └─ loop:
+       ├─ BaiduClient::new(config)
+       ├─ TransferEngine::new(client, config) → (engine, transfer_rx)
+       ├─ App::new(...)
+       ├─ App::start()
+       │    ├─ load_remote()  → tokio::spawn(list_dir) → AppEvent::RemoteLoaded
+       │    ├─ load_quota()   → AppEvent::Quota
+       │    ├─ load_user()    → AppEvent::User
+       │    └─ resume_queue() → 去重并重新 spawn 未完成任务
+       ├─ init_terminal()
+       ├─ event_loop(...)
+       ├─ engine.cancel_all(); save_if_dirty(); restore_terminal()
+       ├─ relogin_requested → login::run(当前配置) → 用新配置重建客户端/引擎
+       ├─ restart_requested → 用导入后的配置重建客户端/引擎
+       └─ 否则退出
 ```
+
+TUI 内的导入/重新登录不会原地修改运行中的 `BaiduClient`。事件循环退出后，`run` 重新构造客户端与传输引擎；队列文件保留未完成任务，重建后自动恢复。
 
 退出时：
 
@@ -182,22 +190,29 @@ ConfigFile {
 首次启动 TUI 且 `account` 为空时，`tui::login::run` 先于主界面运行：
 
 - BDUSS/STOKEN 掩码输入，支持 `Event::Paste` 粘贴完整 Cookie；
-- 第三个字段可填已有 `pcstui.json` 路径，直接读取账号；
-- `Enter` 后构造临时 `RuntimeConfig` 调用 `whoami`，验证成功才 `config.save()`；
+- 第三个字段可填已有明文 `pcstui.json` 路径，直接读取账号；
+- `Enter` 后构造临时 `RuntimeConfig` 调用 `whoami`，验证成功才替换配置；
+- 替换前把旧配置复制为 `pcstui.json.bak-<时间戳>`（`0600`，`create_new` 防覆盖）；
 - 失败停留在登录页并显示错误，`Esc` 退出。
 
-CLI 登录：`login [--cookie ... | --bduss ... --stoken ...] [--uid] [--name]` 构造 `Account`，原子写入后调用 `whoami` 回填 uid/name。`uid` 可省略（下载签名接受 `0`，在线信息会覆盖它）。交互式 `pcstui login` 在 TTY 下隐藏输入。
+CLI 登录：`login [--cookie ... | --bduss ... --stoken ...] [--uid] [--name]` 构造 `Account`，原子写入后调用 `whoami` 回填 uid/name。`uid` 可省略（下载签名接受 `0`，在线信息会覆盖它）。交互式 `pcstui login` 在 TTY 下隐藏输入。CLI 是次级入口，不扩展 TUI 的配置面板功能。
 
-`login --from-config <FILE>` / `config import <FILE>`：
+TUI 主界面的“配置与诊断”面板（`C`）是配置操作的主入口：
 
-- 读取完整 `pcstui.json`，包括账号与传输设置；
-- 拒绝不含账号的文件（脱敏模板只能手工填写）；
-- 相对 `download_dir` 会按新项目根目录重新解释；
-- 导入后立即在线验证。
+- `e` 导出含凭据的明文副本，`E` 导出脱敏模板；导出目标已存在时拒绝写入；
+- `export_to` 拒绝把当前活动配置文件当作导出目标；
+- `i` 读取明文配置 → 在线验证 → 二次确认 → 备份旧配置 → 原子替换 → 重启客户端与引擎；
+- `r` 重新登录：取消当前传输后回到登录页，重建 `BaiduClient` / `TransferEngine`，未完成任务由 `config/queue.json` 恢复；
+- `d` 刷新本地权限检查与在线诊断。
+
+缓存安全边界：
+
+- 加密/压缩配置（age、gpg、gzip、zip、7z 或非 UTF-8 二进制）直接拒绝，并提示先用外部工具解密；pcstui 不实现解密；
+- `config import` / 登录导入使用同一套校验和备份逻辑。
 
 `config export [--redacted] <FILE>` 生成可移植副本；`--redacted` 移除账号，供安全分享。导出同样使用临时文件 + rename，并保持 `0600`。
 
-未配置账号时，`BaiduClient::new` 返回包含 TUI 登录页、`pcstui login` 和 `--from-config` 的提示。
+未配置账号时，`BaiduClient::new` 返回提示启动 TUI 登录页或运行 `pcstui login`。
 
 ### 4.4 原子保存与权限
 
@@ -554,6 +569,8 @@ CLI 与 TUI 共用：
 
 差异主要在进度输出与退出码。CLI 的 `download --dest` / `upload --dest` 都按“目录”语义处理；`--connections`/`--retries` 覆盖本次下载的配置。CLI 不经过 `TransferEngine`，也不写 `config/queue.json`；它的断点仍由 `.pcstui.part` 和 `upload-state` 保证，重新执行同一命令即可续传。
 
+CLI 定位为次级/脚本入口，不再扩展与 TUI 对等的功能；配置面板、诊断浮层和重新登录只在 TUI 提供。`login --from-config` 与 `config import` 现在都先 `adopt_file` 到内存、在线验证成功后才 `save_with_backup()` 替换，验证失败不会破坏当前配置。
+
 ## 9. 错误处理与可观测性
 
 - 入口统一 `anyhow::Result`，`main` 打印 `{:#}` 链式错误并以 1 退出；
@@ -564,6 +581,7 @@ CLI 与 TUI 共用：
   - 账号是否存在；
   - 网络/认证/配额/根目录；
   - 下载目录可写性。
+- TUI 配置面板（`C`）提供同类本地检查（配置文件/目录权限、下载目录、上传断点目录、队列可读性）和在线账号/容量/根目录状态，无需离开终端。
 - `RUST_LOG=debug` 可打开 `tracing` 日志（默认 `warn`，写 stderr）。
 
 ## 10. 安全模型
@@ -571,6 +589,8 @@ CLI 与 TUI 共用：
 | 资产 | 措施 |
 | --- | --- |
 | BDUSS/STOKEN | 仅存本地配置，`0600`；日志/`doctor` 掩码 |
+| 配置替换 | 导入先在线验证，再二次确认；替换前备份旧文件（`create_new`、`0600`）；导出拒绝覆盖活动配置 |
+| 加密配置 | 不实现解密；age/gpg/压缩/二进制文件直接拒绝并提示用户先解密 |
 | 上传状态 | 目录 `0700`，文件 `0600`；不含 Cookie |
 | 下载临时文件 | 与目标同目录，完成后原子替换 |
 | 远程路径 | `sanitize_component` 去除 `/`、`..` 等；本地拼接用 `safe_local_path` |
@@ -599,7 +619,7 @@ CLI 与 TUI 共用：
 
 ### 11.2 集成/冒烟
 
-真实 API 冒烟需要有效 Cookie；建议在专用测试目录进行，避免污染正式目录。完整命令见 `docs/PORT-FEASIBILITY.md` 第 7 节。
+真实 API 冒烟需要有效 Cookie；建议在专用测试目录进行，避免污染正式目录。完整命令见 `docs/ACCEPTANCE.md` 第 3 节。
 
 ### 11.3 未来测试
 
@@ -665,9 +685,11 @@ CLI 与 TUI 共用：
 - 加密直链不破解签名，回退 PCS；
 - 仅保证 Linux TUI；
 - `stat` 依赖父目录列表，超大目录下单次 stat 可能较慢；
-- 破坏性操作目前以绝对路径为目标，尚未在操作前用 `fs_id` 二次 stat 校验。
+- 删除/移动/复制/重命名前会按 `fs_id` 重新 stat 校验；项目已变化时整批中止；
+- 导入/导出只处理明文 JSON；不实现凭据加密/解密，需要时由用户使用 age/gpg；
+- 慢网下 API 请求仍共用 120s 总超时，连接/读取超时拆分尚未实现。
 
 ## 14. 相关文档
 
-- [`PORT-FEASIBILITY.md`](PORT-FEASIBILITY.md)：协议验证、可移植性、风险与验收；
-- [`FEATURE-MATRIX.md`](FEATURE-MATRIX.md)：pcstui 功能与 BaiduPCS-Go 能力对照。
+- [`ACCEPTANCE.md`](ACCEPTANCE.md)：协议验证、验收清单、可移植性、风险与恢复；
+- [`FEATURE-MATRIX.md`](FEATURE-MATRIX.md)：TUI / CLI 功能矩阵与路线。

@@ -1,23 +1,24 @@
 # pcstui
 
-原生 Rust 百度网盘双栏 TUI / CLI。**不依赖 BaiduPCS-Go 二进制，不解析 `pcs` 的终端输出**，所有操作直接走百度网盘 HTTP API。
+原生 Rust 百度网盘双栏 TUI，CLI 作为脚本与冒烟测试入口。所有操作直接走百度网盘 HTTP API。
 
 - 项目位置：`/home/mat/pansync/pcstui`
 - 可执行文件：`target/release/pcstui`
-- 许可证：Apache-2.0（签名/上传协议知识来自 BaiduPCS-Go，见 `NOTICE`）
+- 许可证：Apache-2.0（`NOTICE` 保留协议实现的必要归属）
 - 自包含：源码和可执行文件不含任何账号信息，凭据只保存在可移植的 `config/pcstui.json`
 
 ## 设计目标
 
-- 全部操作直接走百度网盘 HTTP API，不依赖外部 `pcs` 二进制，也不解析终端输出；
+- 全部操作直接走百度网盘 HTTP API；
 - 结构化错误处理、持久化传输队列、断点续传和 MD5 校验；
 - 用 `fs_id` 标识远程对象，避免缓存列表与真实网盘状态不一致导致误操作；
-- 换机只需一个文件：复制 `config/pcstui.json`，或在另一台机器上用 `login --from-config` 导入。
+- TUI 为配置与诊断主入口；CLI 保持最小脚本面，不追求功能对等；
+- 换机只需一个文件：复制 `config/pcstui.json`，或在 TUI 里按 `C` 导入明文配置。
 
 实现说明与取舍见：
 
 - [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md)
-- [`docs/PORT-FEASIBILITY.md`](docs/PORT-FEASIBILITY.md)
+- [`docs/ACCEPTANCE.md`](docs/ACCEPTANCE.md)
 - [`docs/FEATURE-MATRIX.md`](docs/FEATURE-MATRIX.md)
 
 ## 功能
@@ -91,8 +92,9 @@ cargo run --release
 
 - `BDUSS` / `STOKEN` 输入框默认掩码显示；
 - 可直接把浏览器里的完整 Cookie 粘贴到 `BDUSS` 字段，会自动拆出 `STOKEN`；
-- 第三项可填另一台机器导出的 `pcstui.json` 路径，直接导入账号；
+- 第三项可填另一台机器导出的明文 `pcstui.json` 路径，直接导入账号；
 - 按 `Enter` 后先在线验证，验证通过才写入配置；失败会停留在登录页并显示原因；
+- 写入前会把旧配置备份为 `pcstui.json.bak-<时间戳>`；
 - `Esc` 退出。
 
 ### 命令行登录
@@ -107,8 +109,8 @@ pcstui login
 pcstui login --cookie 'BDUSS=...; STOKEN=...'
 pcstui login --bduss '<BDUSS>' --stoken '<STOKEN>'
 
-# 换机/恢复：导入另一份 pcstui.json（含账号与设置）
-pcstui login --from-config /path/to/pcstui.json
+# 换机/恢复：在 TUI 中按 C，再用 i 导入明文 pcstui.json
+pcstui
 
 # 只生成空配置，随后手工编辑
 pcstui config init
@@ -119,18 +121,32 @@ $EDITOR config/pcstui.json
 
 ### 可移植配置
 
-`config/pcstui.json` 是唯一的凭据载体，复制它即可换机：
+`config/pcstui.json` 是唯一的凭据载体，复制它即可换机。TUI 内的“配置与诊断”面板（`C`）是主入口：
+
+| 键 | 操作 |
+| --- | --- |
+| `e` | 导出含账号凭据的明文副本（`0600`） |
+| `E` | 导出脱敏模板（不含账号，可安全分享） |
+| `i` | 导入明文 `pcstui.json`：先在线验证账号，再确认替换 |
+| `r` | 重新登录（重建客户端与传输引擎，未完成任务保留在队列中） |
+| `d` | 刷新本地权限检查与在线诊断 |
+
+导入不会静默覆盖当前配置：验证失败会保留旧配置；验证成功也要再次确认，替换前自动备份旧文件。导出目标已存在时拒绝写入，且永远不能覆盖当前活动配置。
+
+pcstui 不做凭据加密/解密。需要加密保管时，请自行使用 `age` / `gpg`：
 
 ```bash
-# 导出完整副本（含凭据，0600）
+age -p -o pcstui.json.age config/pcstui.json
+age -d -o pcstui.json pcstui.json.age
+```
+
+加密文件不能直接导入；面板会明确提示“先解密为明文 pcstui.json”。
+
+CLI 仅保留次级入口，不追求与 TUI 功能对等：
+
+```bash
 pcstui config export ~/pcstui-portable.json
-
-# 导出脱敏模板（不含账号，可安全分享）
 pcstui config export --redacted ~/pcstui-template.json
-
-# 在新机器上导入
-pcstui login --from-config ~/pcstui-portable.json
-# 或
 pcstui config import ~/pcstui-portable.json
 ```
 
@@ -190,6 +206,7 @@ pcstui doctor
 | `K` | 取消选中的传输 |
 | `y` | 在本地当前目录启动 Yazi |
 | `o` | `xdg-open` 打开本地文件 |
+| `C` | 配置与诊断：导出 / 导入 / 重新登录 / 检查 |
 | `?` | 帮助 |
 | `q` | 退出（活动传输时确认） |
 
@@ -296,9 +313,9 @@ cargo build --release
 ./target/release/pcstui ls /
 ```
 
-单元测试覆盖：签名向量、MD5 混淆解码、sign2、路径规范化/本地路径安全、配置导入/导出与脱敏、Cookie 解析、分块哈希、空文件、上传计划、队列往返、输入光标/单词删除、Tab 补全路径、CLI 参数、排序/过滤。
+单元测试覆盖：签名向量、MD5 混淆解码、sign2、路径规范化/本地路径安全、配置导入/导出与脱敏、加密/二进制配置拒绝、备份替换、导出不覆盖活动配置、Cookie 解析、分块哈希、空文件、上传计划、队列去重/往返、断点状态校验、输入光标/单词删除、Tab 补全路径、TUI 配置面板按键隔离、CLI 参数、排序/过滤。
 
-真实 API 冒烟测试需要有效 BDUSS/STOKEN，见 `docs/PORT-FEASIBILITY.md` 的验收清单。
+真实 API 冒烟测试需要有效 BDUSS/STOKEN，见 `docs/ACCEPTANCE.md` 的验收清单。
 
 ## 目录结构
 
@@ -322,7 +339,7 @@ pcstui/
 ## 可移植性
 
 - 源码和 release 可执行文件不含任何账号、Cookie 或本机路径；全部凭据只在运行时从配置文件读取；
-- `config/pcstui.json` 是自包含的：复制到新机器后用 `login --from-config` 导入即可；
+- `config/pcstui.json` 是自包含的：复制到新机器后，在 TUI 配置面板（`C`）用 `i` 导入即可；
 - 配置文件和队列文件以 `0600` 写入，配置目录为 `0700`，写入采用临时文件 + rename 的原子方式；
 - 日志、`Debug` 输出和 `config show` 只显示掩码后的凭据；
 - 不依赖外部百度网盘客户端，也不需要额外目录或环境变量。
