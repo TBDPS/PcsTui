@@ -26,16 +26,34 @@ pub struct Paths {
 impl Paths {
     pub fn discover() -> Self {
         let root = project_root();
-        let config_dir = env_path("PCSTUI_CONFIG_DIR").unwrap_or_else(|| root.join("config"));
+        let is_system = is_system_install();
+        let config_dir = env_path("PCSTUI_CONFIG_DIR").unwrap_or_else(|| {
+            if is_system && env_path("PCSTUI_HOME").is_none() {
+                xdg_config_dir()
+            } else {
+                root.join("config")
+            }
+        });
         let config_file =
             env_path("PCSTUI_CONFIG").unwrap_or_else(|| config_dir.join("pcstui.json"));
         let config_dir = config_file
             .parent()
             .map(Path::to_path_buf)
             .unwrap_or(config_dir);
-        let download_dir =
-            env_path("PCSTUI_DOWNLOAD_DIR").unwrap_or_else(|| root.join("downloads"));
-        let tmp_dir = env_path("PCSTUI_TMP_DIR").unwrap_or_else(|| root.join("tmp"));
+        let download_dir = env_path("PCSTUI_DOWNLOAD_DIR").unwrap_or_else(|| {
+            if is_system && env_path("PCSTUI_HOME").is_none() {
+                xdg_download_dir()
+            } else {
+                root.join("downloads")
+            }
+        });
+        let tmp_dir = env_path("PCSTUI_TMP_DIR").unwrap_or_else(|| {
+            if is_system && env_path("PCSTUI_HOME").is_none() {
+                std::env::temp_dir().join("pcstui")
+            } else {
+                root.join("tmp")
+            }
+        });
         let upload_state_dir = config_dir.join("upload-state");
         let queue_file = config_dir.join("queue.json");
         Self {
@@ -54,6 +72,45 @@ fn env_path(key: &str) -> Option<PathBuf> {
     env::var_os(key)
         .filter(|value| !value.is_empty())
         .map(PathBuf::from)
+}
+
+fn is_system_install() -> bool {
+    if let Ok(exe) = env::current_exe() {
+        let exe = fs::canonicalize(&exe).unwrap_or(exe);
+        if let Some(parent) = exe.parent() {
+            if parent.file_name().and_then(|n| n.to_str()) == Some("bin") {
+                if let Some(root) = parent.parent() {
+                    return root == Path::new("/usr")
+                        || root == Path::new("/usr/local")
+                        || root.ends_with(".local")
+                        || root.ends_with(".cargo");
+                }
+            }
+        }
+    }
+    false
+}
+
+fn xdg_config_dir() -> PathBuf {
+    if let Some(config_home) = env_path("XDG_CONFIG_HOME") {
+        config_home.join("pcstui")
+    } else if let Some(home) = env::var_os("HOME").map(PathBuf::from) {
+        home.join(".config").join("pcstui")
+    } else {
+        PathBuf::from("config")
+    }
+}
+
+fn xdg_download_dir() -> PathBuf {
+    if let Some(home) = env::var_os("HOME").map(PathBuf::from) {
+        let dl = home.join("Downloads");
+        if dl.is_dir() {
+            return dl;
+        }
+        home
+    } else {
+        PathBuf::from(".")
+    }
 }
 
 /// Find the portable application root.
@@ -92,12 +149,6 @@ pub fn project_root() -> PathBuf {
             if parent.join("Cargo.toml").is_file() {
                 return parent.to_path_buf();
             }
-        }
-    }
-    if let Some(home) = env::var_os("HOME").map(PathBuf::from) {
-        let pansync = home.join("pansync");
-        if pansync.is_dir() {
-            return pansync;
         }
     }
     env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
@@ -205,6 +256,8 @@ pub struct ConfigFile {
     pub user_agent: String,
     #[serde(default)]
     pub download_dir: Option<PathBuf>,
+    #[serde(default)]
+    pub local_dir: Option<PathBuf>,
     #[serde(default = "default_remote_dir")]
     pub last_remote_dir: String,
     #[serde(default)]
@@ -240,6 +293,7 @@ impl Default for ConfigFile {
             pan_ua: DEFAULT_PAN_UA.to_string(),
             user_agent: DEFAULT_USER_AGENT.to_string(),
             download_dir: None,
+            local_dir: None,
             last_remote_dir: DEFAULT_REMOTE_DIR.to_string(),
             transfer: TransferConfig::default(),
         }
@@ -409,6 +463,12 @@ impl RuntimeConfig {
                 Err(_) => Some(dir),
             };
         }
+        if let Some(dir) = file.local_dir.take() {
+            file.local_dir = match dir.strip_prefix(&self.paths.root) {
+                Ok(relative) => Some(relative.to_path_buf()),
+                Err(_) => Some(dir),
+            };
+        }
         if redacted {
             file.account = None;
         }
@@ -428,6 +488,11 @@ impl RuntimeConfig {
         if let Some(dir) = &file.download_dir {
             if let Ok(relative) = dir.strip_prefix(&self.paths.root) {
                 file.download_dir = Some(relative.to_path_buf());
+            }
+        }
+        if let Some(dir) = &file.local_dir {
+            if let Ok(relative) = dir.strip_prefix(&self.paths.root) {
+                file.local_dir = Some(relative.to_path_buf());
             }
         }
         self.file = file;
