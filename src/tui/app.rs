@@ -401,6 +401,12 @@ impl InputState {
         self.cursor += 1;
     }
 
+    fn insert_text(&mut self, text: &str) {
+        for ch in text.chars().filter(|ch| !ch.is_control() || *ch == '\t') {
+            self.insert(ch);
+        }
+    }
+
     fn backspace(&mut self) {
         if self.cursor == 0 {
             return;
@@ -1015,6 +1021,12 @@ impl App {
         self.transfer_selected = self
             .transfer_selected
             .min(self.transfers.len().saturating_sub(1));
+    }
+
+    pub fn handle_paste(&mut self, text: &str) {
+        if let Some(input) = self.input.as_mut() {
+            input.insert_text(text);
+        }
     }
 
     pub fn handle_key(&mut self, key: KeyEvent) {
@@ -2703,6 +2715,14 @@ mod tests {
         assert_eq!(input.value, "alpha ");
         input.delete_word_left();
         assert_eq!(input.value, "");
+    }
+
+    #[test]
+    fn input_paste_supports_multibyte_and_strips_control_chars() {
+        let mut input = InputState::new("t", "p", "prefix_".to_string(), InputKind::Goto);
+        input.insert_text("粘贴\x1b[31m文本\t2026\n");
+        assert_eq!(input.value, "prefix_粘贴[31m文本\t2026");
+        assert_eq!(input.cursor, "prefix_粘贴[31m文本\t2026".chars().count());
     }
 
     #[test]

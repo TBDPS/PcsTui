@@ -391,6 +391,13 @@ pub async fn upload_one(
             let md5 = match uploaded {
                 Ok(md5) => md5,
                 Err(err) => {
+                    if err.is_upload_id_expired() {
+                        remove_state(&state_file);
+                        return Err(anyhow!(
+                            "上传会话已在服务端失效或过期（已清理旧断点，重新运行上传即可新建会话）: {}",
+                            describe_upload_error(&err)
+                        ));
+                    }
                     if attempt >= options.retries {
                         return Err(anyhow!(
                             "上传分片 {} 失败: {}",
@@ -455,7 +462,7 @@ pub async fn upload_one(
         bail!("仍有分片未完成，断点已保存，可重新运行上传");
     }
     reporter.set_status(TransferStatus::Running, "正在合并分片");
-    client
+    if let Err(err) = client
         .create_file(
             &upload_id,
             &remote_path,
@@ -463,7 +470,16 @@ pub async fn upload_one(
             &json_block_list(&block_list),
         )
         .await
-        .map_err(|err| anyhow!(describe_upload_error(&err)))?;
+    {
+        if err.is_upload_id_expired() {
+            remove_state(&state_file);
+            return Err(anyhow!(
+                "合并分片失败，上传会话已在服务端失效或过期（已清理旧断点，重新运行上传即可新建会话）: {}",
+                describe_upload_error(&err)
+            ));
+        }
+        return Err(anyhow!(describe_upload_error(&err)));
+    }
     verify_uploaded_content(client, &remote_path, &hashes.md5).await?;
     // Keep the completed block list until content verification passes, so a
     // retry can merge again without re-uploading every block.

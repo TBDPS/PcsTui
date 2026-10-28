@@ -91,6 +91,9 @@ async fn event_loop(
                     Some(Ok(Event::Key(key))) if key.kind == KeyEventKind::Press => {
                         app.handle_key(key);
                     }
+                    Some(Ok(Event::Paste(text))) => {
+                        app.handle_paste(&text);
+                    }
                     Some(Ok(Event::Resize(_, _))) => {}
                     Some(Ok(_)) => {}
                     Some(Err(err)) => return Err(anyhow!("读取终端事件失败: {err}")),

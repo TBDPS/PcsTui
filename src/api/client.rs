@@ -68,6 +68,23 @@ impl ApiError {
             _ => false,
         }
     }
+
+    pub fn is_upload_id_expired(&self) -> bool {
+        match self {
+            ApiError::Remote { errno, message, .. } => {
+                let msg_lower = message.to_ascii_lowercase();
+                matches!(*errno, 31360..=31363)
+                    || (msg_lower.contains("uploadid")
+                        && (msg_lower.contains("not exist")
+                            || msg_lower.contains("expired")
+                            || msg_lower.contains("invalid")
+                            || message.contains("不存在")
+                            || message.contains("过期")
+                            || message.contains("无效")))
+            }
+            _ => false,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -780,4 +797,36 @@ fn _status_ok(status: StatusCode) -> bool {
 #[allow(dead_code)]
 fn _deserialize<T: DeserializeOwned>(value: Value) -> Result<T, serde_json::Error> {
     serde_json::from_value(value)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn identifies_expired_upload_id() {
+        let err1 = ApiError::Remote {
+            errno: 31363,
+            message: "uploadid not exist".to_string(),
+            request_id: None,
+            context: "上传分片".to_string(),
+        };
+        assert!(err1.is_upload_id_expired());
+
+        let err2 = ApiError::Remote {
+            errno: -8,
+            message: "uploadid已过期".to_string(),
+            request_id: None,
+            context: "合并分片".to_string(),
+        };
+        assert!(err2.is_upload_id_expired());
+
+        let err3 = ApiError::Remote {
+            errno: -9,
+            message: "文件不存在".to_string(),
+            request_id: None,
+            context: "stat".to_string(),
+        };
+        assert!(!err3.is_upload_id_expired());
+    }
 }
