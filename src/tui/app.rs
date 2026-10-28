@@ -572,7 +572,28 @@ impl App {
         engine: TransferEngine,
         tx: UnboundedSender<AppEvent>,
     ) -> Self {
-        let local_cwd = std::env::current_dir().unwrap_or_else(|_| config.paths.root.clone());
+        let local_cwd = if let Some(download_dir) = &config.file.download_dir {
+            let expanded = crate::config::expand_tilde(download_dir);
+            if expanded.is_relative() {
+                config.paths.root.join(expanded)
+            } else {
+                expanded
+            }
+        } else if std::env::var_os("PCSTUI_HOME").is_some() {
+            config.paths.root.clone()
+        } else if let Ok(cwd) = std::env::current_dir() {
+            let is_home = std::env::var_os("HOME")
+                .map(PathBuf::from)
+                .map(|h| h == cwd)
+                .unwrap_or(false);
+            if is_home || cwd == config.paths.root {
+                config.paths.root.clone()
+            } else {
+                cwd
+            }
+        } else {
+            config.paths.root.clone()
+        };
         let mut local = LocalPane::new(local_cwd);
         local.reload();
         let remote = RemotePane::new(config.file.last_remote_dir.clone());

@@ -69,11 +69,6 @@ pub fn project_root() -> PathBuf {
     if let Ok(exe) = env::current_exe() {
         let exe = fs::canonicalize(&exe).unwrap_or(exe);
         if let Some(parent) = exe.parent() {
-            if parent.file_name().and_then(|n| n.to_str()) == Some("bin") {
-                if let Some(root) = parent.parent() {
-                    return root.to_path_buf();
-                }
-            }
             if let Some(target) = parent.parent() {
                 if target.file_name().and_then(|n| n.to_str()) == Some("target") {
                     if let Some(root) = target.parent() {
@@ -81,11 +76,28 @@ pub fn project_root() -> PathBuf {
                     }
                 }
             }
+            if parent.file_name().and_then(|n| n.to_str()) == Some("bin") {
+                if let Some(root) = parent.parent() {
+                    let is_system_bin = root == Path::new("/usr")
+                        || root == Path::new("/usr/local")
+                        || root.ends_with(".local")
+                        || root.ends_with(".cargo");
+                    if !is_system_bin {
+                        return root.to_path_buf();
+                    }
+                }
+            }
             // A standalone binary in an arbitrary directory owns its config
             // and downloads next to itself.
-            if parent.join("Cargo.toml").is_file() || !parent.as_os_str().is_empty() {
+            if parent.join("Cargo.toml").is_file() {
                 return parent.to_path_buf();
             }
+        }
+    }
+    if let Some(home) = env::var_os("HOME").map(PathBuf::from) {
+        let pansync = home.join("pansync");
+        if pansync.is_dir() {
+            return pansync;
         }
     }
     env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
