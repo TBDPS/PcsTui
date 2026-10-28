@@ -2,6 +2,7 @@
 /config/
 /downloads/
 /tmp/
+/docs/
 *.pcstui.part
 *.pcstui.part.state.json
 pcstui-portable-*.json
