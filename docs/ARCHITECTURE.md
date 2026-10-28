@@ -349,19 +349,20 @@ download_plan(plan, options, cancel, reporter)
 download_one
   ├─ resolve_target：存在时按 overwrite/rename/同大小跳过
   ├─ 目标目录创建
-  ├─ .<name>.pcstui.part
+  ├─ .<name>.<fs_id>.pcstui.part（fs_id 缺失时用远程路径指纹）
   ├─ 若存在 .state.json：
-  │    ├─ 有效 → 恢复多连接分片位图
-  │    ├─ 损坏/过期 → 删除 .part 与状态，从头开始
+  │    ├─ 有效且 .part 长度/指纹匹配 → 恢复多连接分片位图
+  │    ├─ .part 缺失或截断 → 删除 .part 与状态，从头开始
+  │    ├─ 指纹变化 → 重新校验已完成分片 MD5，坏分片标记为未完成
   │    └─ 全部完成且 .part 长度正确 → 直接 finalize
   ├─ 大文件（≥64 MiB）且 connections>1 且无既有断点：
   │    ├─ download_link(path)
   │    ├─ 1 字节 Range 预检
-  │    ├─ 写 RangeState（4 MiB 分片位图）
+  │    ├─ 写 RangeState（4 MiB 分片位图 + 分片 MD5）
   │    └─ download_multi：最多 connections 个 worker
   │         ├─ 每个分片闭合 Range [start, end]
   │         ├─ 分片失败重新取链 + 指数退避重试
-  │         ├─ 成功后写位图并原子保存 state
+  │         ├─ 分片 flush + sync_data 后记录 MD5、位图和 .part 指纹
   │         └─ 返回 200/401/403 → Unsupported，回退单流
   ├─ 单流：闭合 Range 4 MiB 一段，从 .part 长度续传
   │    ├─ 206 → 追加
@@ -374,6 +375,7 @@ download_one
        ├─ 不一致时读取服务端 Content-MD5 作为权威值
        ├─ 仍不一致时尝试“分片列表 JSON 的 MD5”兼容匹配
        ├─ 覆盖/重命名策略
+       ├─ sync_all(.part)
        ├─ rename(.part → target)
        └─ 设置 mtime
 ```
@@ -381,7 +383,8 @@ download_one
 关键设计：
 
 - `.part` 与目标同目录，避免跨文件系统 rename；
-- 多连接状态文件为 `.<name>.pcstui.part.state.json`，记录总大小、分片大小与完成位图；状态与文件不匹配时整段丢弃，绝不拼接稀疏文件；
+- `.part` 名称包含远程身份（`fs_id`，缺失时用远程路径指纹），同名不同远程文件不会共用断点；
+- 多连接状态文件为 `.<name>.<fs_id>.pcstui.part.state.json`，记录总大小、分片大小、完成位图、每个已完成分片的 MD5 和 `.part` 指纹；`.part` 缺失/截断时整段丢弃，指纹变化时重新哈希已完成分片，绝不拼接稀疏文件；
 - 百度对单个闭合 Range 有约 5 MiB 上限，因此分片固定 4 MiB；大文件不能用开放 Range 或无 Range 请求（会返回 403 `31326 user is not authorized`）；
 - 下载请求优先使用 PCS UA + Cookie；401/403 时回退浏览器 UA 的 `download_http`；
 - 目录列表对分片上传合并出的文件返回的是 block-list JSON 的 MD5，不是内容 MD5；下载完成后用下载主机的 `Content-MD5` 做权威校验，避免误删正确文件；
@@ -400,12 +403,12 @@ upload_one
   │    ├─ CRC32
   │    └─ 每个 block 的 MD5（空文件固定为 `[EMPTY_MD5]`）
   ├─ state_path：MD5(local_path, remote_path, size, mtime)
-  ├─ load_state + matches 校验
+  ├─ load_state + matches 校验（包含本地整文件 MD5）
   ├─ 无可用 uploadid：
   │    ├─ ensure_remote_dir
   │    ├─ precreate
   │    ├─ return_type=2 → 秒传完成
-  │    └─ 保存新 state
+  │    └─ 保存新 state（写入后 sync_all）
   ├─ 逐分片：
   │    ├─ 已完成 → 跳过
   │    ├─ superfile2 上传（multipart 字段 `uploadedfile`）
@@ -417,7 +420,7 @@ upload_one
   │    ├─ 与本地整文件 MD5 一致 → 成功
   │    ├─ 明确不一致 → 重试 3 次后失败
   │    └─ 头部缺失/接口不可用 → 容忍，不误报失败
-  └─ 删除 state
+  └─ 校验通过后删除 state（失败时保留，便于重新合并）
 ```
 
 分块大小：
@@ -643,7 +646,8 @@ CLI 与 TUI 共用：
 `QueueStore` 已实现 `config/queue.json` 的持久化：
 
 - `QueuedTaskKind::{Download, Upload}` 记录重建任务所需的源、目标与选项；
-- `App::start()` 调用 `resume_queue()` 重新 `spawn_*`；
+- `QueuedTask::identity()` 定义任务身份（下载：`fs_id + 远程路径 + 本地根目录`；上传：`本地路径 + 远程目录`），`QueueStore::add` 拒绝重复任务；
+- `App::start()` 调用 `resume_queue()` 重新 `spawn_*`，启动时先清理历史重复项；
 - `TransferEvent::Finished` 时按 `queue_ids` 移除对应任务并保存；
 - 字节级断点仍由 `.pcstui.part` / `config/upload-state` 管理，队列不重复记录分片进度。
 

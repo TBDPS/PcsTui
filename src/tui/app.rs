@@ -638,14 +638,16 @@ impl App {
         cwd: String,
         dest: PathBuf,
         options: DownloadOptions,
-    ) -> u64 {
+    ) -> bool {
         let task = QueuedTask::download(item.clone(), cwd.clone(), dest.clone(), options.clone());
         let queue_id = task.id.clone();
-        self.queue.add(task);
+        if !self.queue.add(task) {
+            return false;
+        }
         self.save_queue();
         let id = self.engine.spawn_download(item, cwd, dest, options);
         self.queue_ids.insert(id, queue_id);
-        id
+        true
     }
 
     fn enqueue_upload(
@@ -653,19 +655,25 @@ impl App {
         local: PathBuf,
         remote_dir: String,
         options: UploadOptions,
-    ) -> u64 {
+    ) -> bool {
         let task = QueuedTask::upload(local.clone(), remote_dir.clone(), options.clone());
         let queue_id = task.id.clone();
-        self.queue.add(task);
+        if !self.queue.add(task) {
+            return false;
+        }
         self.save_queue();
         let id = self.engine.spawn_upload(local, remote_dir, options);
         self.queue_ids.insert(id, queue_id);
-        id
+        true
     }
 
     fn resume_queue(&mut self) {
         if self.queue.tasks.is_empty() {
             return;
+        }
+        let removed = self.queue.dedupe();
+        if removed > 0 {
+            self.save_queue();
         }
         let tasks = self.queue.tasks.clone();
         let count = tasks.len();
@@ -692,7 +700,14 @@ impl App {
             };
             self.queue_ids.insert(id, task.id.clone());
         }
-        self.set_status(format!("已恢复 {count} 个待办传输任务"), false);
+        if removed > 0 {
+            self.set_status(
+                format!("已恢复 {count} 个待办传输任务（移除 {removed} 个重复项）"),
+                false,
+            );
+        } else {
+            self.set_status(format!("已恢复 {count} 个待办传输任务"), false);
+        }
     }
 
     fn push_quick_index(&mut self, ch: char) {
@@ -1693,11 +1708,24 @@ impl App {
         };
         let dest = self.local.cwd.clone();
         let cwd = self.remote.cwd.clone();
+        let total = items.len();
+        let mut added = 0;
         for item in items {
-            self.enqueue_download(item, cwd.clone(), dest.clone(), options.clone());
+            if self.enqueue_download(item, cwd.clone(), dest.clone(), options.clone()) {
+                added += 1;
+            }
         }
         self.marked_remote.clear();
-        self.set_status("已加入下载队列", false);
+        if added == 0 {
+            self.set_status("相同下载任务已在队列中", false);
+        } else if added < total {
+            self.set_status(
+                format!("已加入下载队列（{added}/{total} 项，其余重复已跳过）"),
+                false,
+            );
+        } else {
+            self.set_status(format!("已加入下载队列（{added} 项）"), false);
+        }
     }
 
     fn upload_selected(&mut self) {
@@ -1711,11 +1739,24 @@ impl App {
             retries: self.config.file.transfer.retries,
         };
         let dest = self.remote.cwd.clone();
+        let total = entries.len();
+        let mut added = 0;
         for entry in entries {
-            self.enqueue_upload(entry.path, dest.clone(), options.clone());
+            if self.enqueue_upload(entry.path, dest.clone(), options.clone()) {
+                added += 1;
+            }
         }
         self.marked_local.clear();
-        self.set_status("已加入上传队列", false);
+        if added == 0 {
+            self.set_status("相同上传任务已在队列中", false);
+        } else if added < total {
+            self.set_status(
+                format!("已加入上传队列（{added}/{total} 项，其余重复已跳过）"),
+                false,
+            );
+        } else {
+            self.set_status(format!("已加入上传队列（{added} 项）"), false);
+        }
     }
 
     fn delete_selected(&mut self) {
@@ -1866,8 +1907,22 @@ impl App {
             retries: self.config.file.transfer.retries,
         };
         let dest = self.remote.cwd.clone();
+        let total = paths.len();
+        let mut added = 0;
         for path in paths {
-            self.enqueue_upload(path, dest.clone(), options.clone());
+            if self.enqueue_upload(path, dest.clone(), options.clone()) {
+                added += 1;
+            }
+        }
+        if added == 0 {
+            self.set_status("相同上传任务已在队列中", false);
+        } else if added < total {
+            self.set_status(
+                format!("已加入上传队列（{added}/{total} 项，其余重复已跳过）"),
+                false,
+            );
+        } else {
+            self.set_status(format!("已加入上传队列（{added} 项）"), false);
         }
     }
 

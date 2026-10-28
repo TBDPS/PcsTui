@@ -1,5 +1,5 @@
 use std::fs::File;
-use std::io::Read;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -32,6 +32,10 @@ pub struct UploadState {
     pub local_path: String,
     pub local_size: u64,
     pub local_mtime: i64,
+    /// Whole-file MD5. Prevents resuming blocks from a different file that
+    /// happens to have the same size and mtime.
+    #[serde(default)]
+    pub local_md5: String,
     pub remote_path: String,
     pub upload_id: String,
     pub block_size: u64,
@@ -41,20 +45,23 @@ pub struct UploadState {
 }
 
 impl UploadState {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         local: &Path,
         local_size: u64,
         local_mtime: i64,
+        local_md5: &str,
         remote: &str,
         upload_id: String,
         block_size: u64,
         block_count: usize,
     ) -> Self {
         Self {
-            version: 1,
+            version: 2,
             local_path: local.to_string_lossy().to_string(),
             local_size,
             local_mtime,
+            local_md5: local_md5.to_string(),
             remote_path: remote.to_string(),
             upload_id,
             block_size,
@@ -63,11 +70,19 @@ impl UploadState {
         }
     }
 
-    pub fn matches(&self, local: &Path, size: u64, mtime: i64, remote: &str) -> bool {
-        self.version == 1
+    pub fn matches(
+        &self,
+        local: &Path,
+        size: u64,
+        mtime: i64,
+        local_md5: &str,
+        remote: &str,
+    ) -> bool {
+        self.version == 2
             && self.local_path == local.to_string_lossy()
             && self.local_size == size
             && self.local_mtime == mtime
+            && self.local_md5 == local_md5
             && self.remote_path == remote
             && self.block_md5.len() == self.block_count
     }
@@ -179,7 +194,18 @@ pub fn save_state(path: &Path, state: &UploadState) -> Result<()> {
     }
     let tmp = path.with_extension("json.tmp");
     let data = serde_json::to_vec_pretty(state)?;
-    std::fs::write(&tmp, data)?;
+    {
+        let mut options = std::fs::OpenOptions::new();
+        options.create(true).truncate(true).write(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let mut file = options.open(&tmp)?;
+        file.write_all(&data)?;
+        file.sync_all()?;
+    }
     std::fs::rename(&tmp, path)?;
     #[cfg(unix)]
     {
@@ -250,7 +276,7 @@ pub async fn upload_one(
 
     let state_file = state_path(request.state_dir, request.local, &remote_path, size, mtime);
     let mut state = load_state(&state_file)
-        .filter(|state| state.matches(request.local, size, mtime, &remote_path));
+        .filter(|state| state.matches(request.local, size, mtime, &hashes.md5, &remote_path));
     if let Some(existing) = state.as_ref() {
         if existing.block_size != hashes.block_size || existing.block_count != hashes.blocks.len() {
             state = None;
@@ -290,6 +316,7 @@ pub async fn upload_one(
                 request.local,
                 size,
                 mtime,
+                &hashes.md5,
                 &remote_path,
                 response.upload_id.clone(),
                 hashes.block_size,
@@ -310,6 +337,7 @@ pub async fn upload_one(
             request.local,
             size,
             mtime,
+            &hashes.md5,
             &remote_path,
             upload_id.clone(),
             hashes.block_size,
@@ -436,8 +464,10 @@ pub async fn upload_one(
         )
         .await
         .map_err(|err| anyhow!(describe_upload_error(&err)))?;
-    remove_state(&state_file);
     verify_uploaded_content(client, &remote_path, &hashes.md5).await?;
+    // Keep the completed block list until content verification passes, so a
+    // retry can merge again without re-uploading every block.
+    remove_state(&state_file);
     reporter.update(size, "上传完成");
     Ok(remote_path)
 }
@@ -608,6 +638,30 @@ mod tests {
         assert_eq!(hashes.size, 0);
         assert_eq!(hashes.md5, EMPTY_MD5);
         assert_eq!(hashes.blocks, vec![EMPTY_MD5.to_string()]);
+    }
+
+    #[test]
+    fn upload_state_requires_same_content() {
+        let path = Path::new("/tmp/pcstui-upload-test.bin");
+        let state = UploadState::new(path, 10, 123, "abc", "/remote/x.bin", "uid".into(), 4, 3);
+        assert!(state.matches(path, 10, 123, "abc", "/remote/x.bin"));
+        assert!(!state.matches(path, 10, 123, "def", "/remote/x.bin"));
+        assert!(!state.matches(path, 10, 124, "abc", "/remote/x.bin"));
+        assert!(!state.matches(path, 10, 123, "abc", "/remote/y.bin"));
+    }
+
+    #[test]
+    fn upload_state_round_trips_after_sync() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.json");
+        let local = Path::new("/tmp/pcstui-upload-test.bin");
+        let mut state =
+            UploadState::new(local, 10, 123, "abc", "/remote/x.bin", "uid".into(), 4, 3);
+        state.block_md5[0] = Some("block".to_string());
+        save_state(&path, &state).unwrap();
+        let loaded = load_state(&path).unwrap();
+        assert!(loaded.matches(local, 10, 123, "abc", "/remote/x.bin"));
+        assert_eq!(loaded.complete_blocks(), 1);
     }
 
     #[test]

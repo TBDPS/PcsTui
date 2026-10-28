@@ -107,30 +107,46 @@ const MULTI_THRESHOLD: u64 = 64 * 1024 * 1024;
 // Baidu rejects closed ranges larger than ~5 MiB for large files.
 const RANGE_CHUNK: u64 = 4 * 1024 * 1024;
 
+const RANGE_STATE_VERSION: u32 = 2;
+
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 struct RangeState {
     version: u32,
     total: u64,
     chunk_size: u64,
     completed: Vec<bool>,
+    /// MD5 of each completed chunk. Used to re-validate a `.part` whose
+    /// fingerprint changed (for example after a crash or external truncation).
+    #[serde(default)]
+    chunk_md5: Vec<Option<String>>,
+    /// Size and mtime of the `.part` when the state was last saved. A matching
+    /// fingerprint lets resume skip re-reading every completed chunk.
+    #[serde(default)]
+    part_len: u64,
+    #[serde(default)]
+    part_mtime_ns: u64,
 }
 
 impl RangeState {
     fn new(total: u64) -> Self {
         let chunks = total.div_ceil(RANGE_CHUNK) as usize;
         Self {
-            version: 1,
+            version: RANGE_STATE_VERSION,
             total,
             chunk_size: RANGE_CHUNK,
             completed: vec![false; chunks],
+            chunk_md5: vec![None; chunks],
+            part_len: 0,
+            part_mtime_ns: 0,
         }
     }
 
     fn valid_for(&self, total: u64) -> bool {
-        self.version == 1
+        self.version == RANGE_STATE_VERSION
             && self.total == total
             && self.chunk_size == RANGE_CHUNK
             && self.completed.len() == total.div_ceil(RANGE_CHUNK) as usize
+            && self.chunk_md5.len() == self.completed.len()
     }
 
     fn completed_bytes(&self) -> u64 {
@@ -148,6 +164,78 @@ impl RangeState {
     fn all_done(&self) -> bool {
         self.completed.iter().all(|done| *done)
     }
+}
+
+fn mtime_ns(metadata: &std::fs::Metadata) -> u64 {
+    metadata
+        .modified()
+        .ok()
+        .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|duration| duration.as_nanos().min(u64::MAX as u128) as u64)
+        .unwrap_or(0)
+}
+
+async fn part_fingerprint(path: &Path) -> Option<(u64, u64)> {
+    let metadata = tokio::fs::metadata(path).await.ok()?;
+    Some((metadata.len(), mtime_ns(&metadata)))
+}
+
+async fn md5_range(file: &mut tokio::fs::File, start: u64, length: u64) -> Option<String> {
+    use tokio::io::{AsyncReadExt, AsyncSeekExt};
+    if file.seek(std::io::SeekFrom::Start(start)).await.is_err() {
+        return None;
+    }
+    let mut hasher = Md5::new();
+    let mut remaining = length;
+    let mut buffer = vec![0_u8; 1024 * 1024];
+    while remaining > 0 {
+        let take = (buffer.len() as u64).min(remaining) as usize;
+        match file.read(&mut buffer[..take]).await {
+            Ok(0) => return None,
+            Ok(read) => {
+                hasher.update(&buffer[..read]);
+                remaining -= read as u64;
+            }
+            Err(_) => return None,
+        }
+    }
+    Some(hex::encode(hasher.finalize()))
+}
+
+/// A state file is only trustworthy if the `.part` still has the expected
+/// size. If the fingerprint changed, completed chunks are re-hashed; corrupt
+/// chunks are marked incomplete instead of being silently kept.
+async fn validate_range_state(part: &Path, state: &mut RangeState) -> bool {
+    let Some((part_len, part_mtime_ns)) = part_fingerprint(part).await else {
+        return false;
+    };
+    if part_len != state.total {
+        return false;
+    }
+    if state.part_len == part_len
+        && state.part_mtime_ns != 0
+        && state.part_mtime_ns == part_mtime_ns
+    {
+        return true;
+    }
+    let Ok(mut file) = tokio::fs::File::open(part).await else {
+        return false;
+    };
+    for index in 0..state.completed.len() {
+        if !state.completed[index] {
+            continue;
+        }
+        let start = index as u64 * state.chunk_size;
+        let length = (state.total - start).min(state.chunk_size);
+        let actual = md5_range(&mut file, start, length).await;
+        if state.chunk_md5[index].as_deref() != actual.as_deref() {
+            state.completed[index] = false;
+            state.chunk_md5[index] = None;
+        }
+    }
+    state.part_len = part_len;
+    state.part_mtime_ns = part_mtime_ns;
+    true
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -176,9 +264,17 @@ async fn load_range_state(path: &Path, total: u64) -> Option<RangeState> {
 async fn save_range_state(path: &Path, state: &RangeState) -> Result<()> {
     let data = serde_json::to_vec(state)?;
     let tmp = PathBuf::from(format!("{}.tmp", path.display()));
-    tokio::fs::write(&tmp, data)
-        .await
-        .with_context(|| format!("写入下载断点状态失败: {}", tmp.display()))?;
+    {
+        let mut file = tokio::fs::File::create(&tmp)
+            .await
+            .with_context(|| format!("写入下载断点状态失败: {}", tmp.display()))?;
+        file.write_all(&data)
+            .await
+            .with_context(|| format!("写入下载断点状态失败: {}", tmp.display()))?;
+        file.sync_all()
+            .await
+            .with_context(|| format!("同步下载断点状态失败: {}", tmp.display()))?;
+    }
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -261,17 +357,29 @@ pub async fn download_one(
             .await
             .with_context(|| format!("创建本地目录失败: {}", parent.display()))?;
     }
-    let part = part_path(&target);
+    let part = part_path(&target, item);
     let state_path = range_state_path(&part);
-    let state_exists = tokio::fs::try_exists(&state_path).await.unwrap_or(false);
-    let mut state = if state_exists {
-        load_range_state(&state_path, item.size).await
+    let had_state = tokio::fs::try_exists(&state_path).await.unwrap_or(false);
+    let mut state = if had_state {
+        match load_range_state(&state_path, item.size).await {
+            Some(mut current) => {
+                if validate_range_state(&part, &mut current).await {
+                    // Persist any chunks invalidated by re-hashing, together
+                    // with the refreshed part fingerprint.
+                    save_range_state(&state_path, &current).await?;
+                    Some(current)
+                } else {
+                    None
+                }
+            }
+            None => None,
+        }
     } else {
         None
     };
-    if state_exists && state.is_none() {
-        // Corrupt or stale multi-connection state: never trust a possibly
-        // sparse `.part`, start from a clean slate.
+    if had_state && state.is_none() {
+        // Corrupt, truncated, or missing `.part`: never trust a possibly
+        // sparse partial file, start from a clean slate.
         let _ = tokio::fs::remove_file(&part).await;
         remove_range_state(&state_path).await;
     }
@@ -432,6 +540,7 @@ async fn download_multi(
     let file = tokio::fs::OpenOptions::new()
         .create(true)
         .write(true)
+        .truncate(false)
         .open(part)
         .await
         .with_context(|| format!("打开临时文件失败: {}", part.display()))?;
@@ -545,6 +654,7 @@ async fn download_multi(
                     }
                     let mut stream = response.bytes_stream();
                     let mut got = 0_u64;
+                    let mut chunk_hasher = Md5::new();
                     let mut stream_error = None;
                     loop {
                         tokio::select! {
@@ -561,6 +671,7 @@ async fn download_multi(
                                                 part.display()
                                             )));
                                         }
+                                        chunk_hasher.update(&chunk);
                                         got = got.saturating_add(chunk.len() as u64);
                                     }
                                     Some(Err(err)) => {
@@ -593,10 +704,25 @@ async fn download_multi(
                             part.display()
                         )));
                     }
+                    // Make the bytes durable before the state file claims
+                    // this chunk is complete.
+                    if let Err(err) = file.sync_data().await {
+                        return Err(MultiFailure::Other(anyhow!(
+                            "同步临时文件失败: {}: {err}",
+                            part.display()
+                        )));
+                    }
                     drop(file);
+                    let fingerprint = part_fingerprint(&part).await;
+                    let chunk_md5 = hex::encode(chunk_hasher.finalize());
                     {
                         let mut guard = state.lock().await;
                         guard.completed[index] = true;
+                        guard.chunk_md5[index] = Some(chunk_md5);
+                        if let Some((len, mtime)) = fingerprint {
+                            guard.part_len = len;
+                            guard.part_mtime_ns = mtime;
+                        }
                         if let Err(err) = save_range_state(&state_path, &guard).await {
                             return Err(MultiFailure::Other(err));
                         }
@@ -937,6 +1063,20 @@ async fn finalize_download(
             }
         }
     }
+    if let Some(reporter) = reporter.as_deref_mut() {
+        reporter.set_status(TransferStatus::Verifying, "正在同步文件");
+    }
+    {
+        let file = tokio::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(part)
+            .await
+            .with_context(|| format!("打开临时文件失败: {}", part.display()))?;
+        file.sync_all()
+            .await
+            .with_context(|| format!("同步临时文件失败: {}", part.display()))?;
+    }
     if tokio::fs::try_exists(target).await.unwrap_or(false) {
         if options.overwrite {
             tokio::fs::remove_file(target)
@@ -949,6 +1089,13 @@ async fn finalize_download(
     tokio::fs::rename(part, target)
         .await
         .with_context(|| format!("保存文件失败: {}", target.display()))?;
+    if let Some(parent) = target.parent() {
+        let parent = parent.to_path_buf();
+        let _ = tokio::task::spawn_blocking(move || {
+            std::fs::File::open(&parent).and_then(|dir| dir.sync_all())
+        })
+        .await;
+    }
     if item.mtime > 0 {
         let path = target.to_path_buf();
         let mtime = item.mtime;
@@ -1003,13 +1150,24 @@ pub fn unique_path(path: &Path) -> PathBuf {
     parent.join(format!("{stem}-{}", uuid::Uuid::new_v4()))
 }
 
-pub fn part_path(target: &Path) -> PathBuf {
+pub fn part_path(target: &Path, item: &RemoteItem) -> PathBuf {
     let parent = target.parent().unwrap_or_else(|| Path::new("."));
     let name = target
         .file_name()
         .map(|value| value.to_string_lossy().to_string())
         .unwrap_or_else(|| "download".to_string());
-    parent.join(format!(".{name}.pcstui.part"))
+    // The final target can be shared by different remote files with the same
+    // name. Include the remote identity so their partial files never collide.
+    let identity = if item.fs_id != 0 {
+        format!("{:x}", item.fs_id)
+    } else {
+        let mut hasher = Md5::new();
+        hasher.update(item.path.as_bytes());
+        hasher.update(b"\0");
+        hasher.update(item.name.as_bytes());
+        hex::encode(hasher.finalize())[..12].to_string()
+    };
+    parent.join(format!(".{name}.{identity}.pcstui.part"))
 }
 
 pub fn is_md5(value: &str) -> bool {
@@ -1156,4 +1314,109 @@ fn truncate(text: &str, max: usize) -> String {
         end -= 1;
     }
     format!("{}…", &text[..end])
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn part_paths_include_remote_identity() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("same.bin");
+        let first = RemoteItem {
+            fs_id: 1,
+            name: "same.bin".to_string(),
+            path: "/a/same.bin".to_string(),
+            ..Default::default()
+        };
+        let second = RemoteItem {
+            fs_id: 2,
+            name: "same.bin".to_string(),
+            path: "/b/same.bin".to_string(),
+            ..Default::default()
+        };
+        assert_eq!(part_path(&target, &first), part_path(&target, &first));
+        assert_ne!(part_path(&target, &first), part_path(&target, &second));
+
+        // Without an fs_id, fall back to a stable remote-path fingerprint.
+        let unknown_a = RemoteItem {
+            fs_id: 0,
+            name: "same.bin".to_string(),
+            path: "/a/same.bin".to_string(),
+            ..Default::default()
+        };
+        let unknown_b = RemoteItem {
+            fs_id: 0,
+            name: "same.bin".to_string(),
+            path: "/b/same.bin".to_string(),
+            ..Default::default()
+        };
+        assert_eq!(
+            part_path(&target, &unknown_a),
+            part_path(&target, &unknown_a)
+        );
+        assert_ne!(
+            part_path(&target, &unknown_a),
+            part_path(&target, &unknown_b)
+        );
+    }
+
+    #[tokio::test]
+    async fn range_state_rejects_missing_or_truncated_part() {
+        let dir = tempfile::tempdir().unwrap();
+        let part = dir.path().join("part");
+        let total = RANGE_CHUNK + 10;
+        let mut state = RangeState::new(total);
+
+        assert!(!validate_range_state(&part, &mut state).await);
+
+        std::fs::write(&part, vec![3_u8; total as usize]).unwrap();
+        state.completed = vec![true, true];
+        state.chunk_md5 = vec![Some("a".to_string()), Some("b".to_string())];
+        let metadata = std::fs::metadata(&part).unwrap();
+        state.part_len = total;
+        state.part_mtime_ns = mtime_ns(&metadata);
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&part)
+            .unwrap()
+            .set_len(total - 1)
+            .unwrap();
+        assert!(!validate_range_state(&part, &mut state).await);
+    }
+
+    #[tokio::test]
+    async fn range_state_rehashes_corrupt_chunks() {
+        let dir = tempfile::tempdir().unwrap();
+        let part = dir.path().join("part");
+        let total = RANGE_CHUNK + 10;
+        let data = vec![7_u8; total as usize];
+        std::fs::write(&part, &data).unwrap();
+        let first_len = RANGE_CHUNK as usize;
+        let first_md5 = hex::encode(Md5::digest(&data[..first_len]));
+
+        let mut state = RangeState::new(total);
+        state.completed = vec![true, true];
+        state.chunk_md5 = vec![Some("deadbeef".to_string()), Some("deadbeef".to_string())];
+        assert!(validate_range_state(&part, &mut state).await);
+        assert!(!state.completed[0]);
+        assert!(!state.completed[1]);
+
+        state.completed[0] = true;
+        state.chunk_md5[0] = Some(first_md5);
+        state.part_len = 0;
+        state.part_mtime_ns = 0;
+        assert!(validate_range_state(&part, &mut state).await);
+        assert!(state.completed[0]);
+        assert!(!state.completed[1]);
+    }
+
+    #[test]
+    fn range_state_rejects_old_versions() {
+        let mut state = RangeState::new(RANGE_CHUNK);
+        assert!(state.valid_for(RANGE_CHUNK));
+        state.version = 1;
+        assert!(!state.valid_for(RANGE_CHUNK));
+    }
 }
