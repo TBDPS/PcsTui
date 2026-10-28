@@ -6,4 +6,5 @@
 *.pcstui.part.state.json
 pcstui-portable-*.json
 pcstui-redacted-*.json
+pcstui.lock
 .DS_Store

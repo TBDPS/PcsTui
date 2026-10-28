@@ -76,7 +76,8 @@ PCSTUI_HOME=/tmp/pcstui-fresh pcstui doctor
 - 新目录无需手工编辑即可完成账号验证；
 - 导入后的 `config/pcstui.json` 为 `0600`，配置目录为 `0700`；
 - `--redacted` 导出不含 `account`，导入时被拒绝；
-- 源码与 release 可执行文件中检索不到 BDUSS/STOKEN 明文。
+- 源码与 release 可执行文件中检索不到 BDUSS/STOKEN 明文；
+- 正在运行 TUI 或传输时，另一个修改状态的实例会被优雅阻断并提示持有者 PID，只读查询命令可正常执行。
 
 ## 4. 仍需人工确认
 

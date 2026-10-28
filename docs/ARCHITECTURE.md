@@ -226,6 +226,14 @@ TUI 主界面的“配置与诊断”面板（`C`）是配置操作的主入口�
 目录在创建后 `chmod 0700`；上传状态文件写入后 `chmod 0600`。非 Unix 平台跳过权限设置。
 备份文件 `pcstui.json.bak-*` 在保存前生成，采用保留策略最多保留最近 3 份历史备份。
 
+### 4.5 单实例排他锁（Instance Lock）
+
+为防止多进程并发启动 TUI 或运行变更型 CLI（下载、上传、登录、配置导入/初始化）造成 `config/pcstui.json`、`config/queue.json` 与上传断点状态写冲突，pcstui 在 `config/pcstui.lock` 维护单实例排他锁：
+
+- **内核级建议锁**：基于 `fd-lock`，在 Unix 平台使用内核 `flock`，在 Windows 平台使用 `LockFileEx`。进程异常崩溃或被终止时，操作系统内核会自动释放文件描述符锁，彻底杜绝孤儿死锁；
+- **友好冲突提示**：持有锁时向 `pcstui.lock` 写入当前进程 PID、运行模式及启动时间；若锁已被占用，冲突进程会读取持有者信息并输出阻断提示；
+- **读写解耦**：只读 CLI 指令（`whoami`、`quota`、`ls`、`search`、`doctor` 等）不尝试获取排他锁，可与正在运行的 TUI 实例安全并发执行。
+
 ## 5. API 层
 
 ### 5.1 两个 HTTP 客户端

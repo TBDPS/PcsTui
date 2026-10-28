@@ -170,7 +170,10 @@ pub enum ConfigAction {
 pub async fn run(cli: Cli) -> Result<()> {
     let config = RuntimeConfig::load_from(cli.config.clone())?;
     match cli.command.unwrap_or(Command::Tui) {
-        Command::Tui => crate::tui::run(config).await,
+        Command::Tui => {
+            let _lock = crate::lock::InstanceLock::try_acquire(&config.paths.config_dir, "tui")?;
+            crate::tui::run(config).await
+        }
         Command::Whoami { json } => whoami(config, json).await,
         Command::Quota { json } => quota(config, json).await,
         Command::Ls { path, json, long } => ls(config, &path, json, long).await,
@@ -189,6 +192,8 @@ pub async fn run(cli: Cli) -> Result<()> {
             connections,
             retries,
         } => {
+            let _lock =
+                crate::lock::InstanceLock::try_acquire(&config.paths.config_dir, "cli-download")?;
             download(
                 config,
                 &remote,
@@ -206,7 +211,11 @@ pub async fn run(cli: Cli) -> Result<()> {
             dest,
             chunk_mib,
             quiet,
-        } => upload(config, local, dest, chunk_mib, quiet).await,
+        } => {
+            let _lock =
+                crate::lock::InstanceLock::try_acquire(&config.paths.config_dir, "cli-upload")?;
+            upload(config, local, dest, chunk_mib, quiet).await
+        }
         Command::Mkdir { path } => mkdir(config, &path).await,
         Command::Rm { paths, yes } => rm(config, &paths, yes).await,
         Command::Mv { source, dest } => mv(config, &source, &dest).await,
@@ -220,7 +229,29 @@ pub async fn run(cli: Cli) -> Result<()> {
             stoken,
             uid,
             name,
-        } => login(config, from_config, cookie, bduss, stoken, uid, name).await,
+        } => {
+            let _lock =
+                crate::lock::InstanceLock::try_acquire(&config.paths.config_dir, "cli-login")?;
+            login(config, from_config, cookie, bduss, stoken, uid, name).await
+        }
+        Command::Config {
+            action: ConfigAction::Import { path },
+        } => {
+            let _lock = crate::lock::InstanceLock::try_acquire(
+                &config.paths.config_dir,
+                "cli-config-import",
+            )?;
+            config_command(config, ConfigAction::Import { path }).await
+        }
+        Command::Config {
+            action: ConfigAction::Init,
+        } => {
+            let _lock = crate::lock::InstanceLock::try_acquire(
+                &config.paths.config_dir,
+                "cli-config-init",
+            )?;
+            config_command(config, ConfigAction::Init).await
+        }
         Command::Config { action } => config_command(config, action).await,
     }
 }
