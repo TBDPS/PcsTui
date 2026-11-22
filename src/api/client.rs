@@ -7,17 +7,18 @@ use chrono::Utc;
 use reqwest::header::{COOKIE, RANGE, REFERER, USER_AGENT};
 use reqwest::{Client, Response, StatusCode, Url};
 use serde::Deserialize;
-use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
 use thiserror::Error;
 use tokio::io::{AsyncReadExt, AsyncSeekExt};
 use tokio_util::io::ReaderStream;
 
-use crate::api::models::{ApiListItem, Quota, RemoteItem, UserInfo, remote_join, remote_parent};
+use crate::api::models::{
+    ApiListItem, Quota, RemoteItem, UserInfo, normalize_remote, remote_join, remote_parent,
+};
 use crate::api::sign;
 use crate::config::{Account, RuntimeConfig};
 
-const PAN_BASE: &str = "https://pan.baidu.com";
+pub(crate) const PAN_BASE: &str = "https://pan.baidu.com";
 const PCS_BASE: &str = "https://pcs.baidu.com";
 
 #[derive(Debug, Error)]
@@ -98,10 +99,12 @@ pub struct PrecreateResult {
 #[derive(Clone)]
 pub struct BaiduClient {
     http: Client,
+    transfer_http: Client,
     download_http: Client,
     account: Account,
     app_id: u32,
     pan_ua: String,
+    user_agent: String,
 }
 
 impl BaiduClient {
@@ -127,10 +130,19 @@ impl BaiduClient {
                 .map_err(|_| ApiError::Other("User-Agent 含有非法字符".to_string()))?,
         );
         let http = Client::builder()
+            .default_headers(headers.clone())
+            .redirect(reqwest::redirect::Policy::limited(5))
+            .connect_timeout(Duration::from_secs(15))
+            .read_timeout(Duration::from_secs(30))
+            .timeout(Duration::from_secs(120))
+            .build()?;
+        // Authenticated data-transfer client without a total request timeout,
+        // using read_timeout to detect stalled sockets on slow networks.
+        let transfer_http = Client::builder()
             .default_headers(headers)
             .redirect(reqwest::redirect::Policy::limited(5))
             .connect_timeout(Duration::from_secs(15))
-            .timeout(Duration::from_secs(120))
+            .read_timeout(Duration::from_secs(60))
             .build()?;
         // Signed download hosts are picky about browser-style user agents.
         // Keep the PCS UA for the cookie-authenticated fallback.
@@ -138,14 +150,21 @@ impl BaiduClient {
             .user_agent(&config.file.user_agent)
             .redirect(reqwest::redirect::Policy::limited(10))
             .connect_timeout(Duration::from_secs(15))
+            .read_timeout(Duration::from_secs(60))
             .build()?;
         Ok(Self {
             http,
+            transfer_http,
             download_http,
             account,
             app_id: config.file.app_id,
             pan_ua,
+            user_agent: config.file.user_agent.clone(),
         })
+    }
+
+    pub(crate) fn browser_ua(&self) -> &str {
+        &self.user_agent
     }
 
     pub fn account(&self) -> &Account {
@@ -195,7 +214,8 @@ impl BaiduClient {
 
     /// List a remote directory, following the web API's 1000-entry pages.
     pub async fn list_dir(&self, path: &str) -> Result<Vec<RemoteItem>, ApiError> {
-        let path = if path.trim().is_empty() { "/" } else { path };
+        let normalized = normalize_remote(path);
+        let path = normalized.as_str();
         let mut items = Vec::new();
         let mut seen = HashSet::new();
         for page in 1..=2000 {
@@ -245,7 +265,8 @@ impl BaiduClient {
     /// cross-client `stat` endpoint, and listing the parent is cheap enough
     /// for interactive use.
     pub async fn stat(&self, path: &str) -> Result<RemoteItem, ApiError> {
-        let path = if path.trim().is_empty() { "/" } else { path };
+        let normalized = normalize_remote(path);
+        let path = normalized.as_str();
         if path == "/" {
             return Ok(RemoteItem {
                 name: "/".to_string(),
@@ -274,12 +295,15 @@ impl BaiduClient {
         directory: &str,
         recursive: bool,
     ) -> Result<Vec<RemoteItem>, ApiError> {
+        let dir = normalize_remote(directory);
         let mut url = Url::parse(&format!("{PAN_BASE}/rest/2.0/xpan/file"))?;
         url.query_pairs_mut()
             .append_pair("method", "search")
             .append_pair("key", keyword)
-            .append_pair("dir", directory)
+            .append_pair("dir", &dir)
             .append_pair("recursion", if recursive { "1" } else { "0" })
+            .append_pair("num", "1000")
+            .append_pair("page", "1")
             .append_pair("web", "1");
         let value = self.get_value(url, "搜索网盘").await?;
         let list = value
@@ -464,7 +488,7 @@ impl BaiduClient {
                 .header(REFERER, "https://pan.baidu.com/")
                 .header(RANGE, format!("bytes={start}-{end}"))
         };
-        let response = build(&self.http).send().await?;
+        let response = build(&self.transfer_http).send().await?;
         if response.status() == StatusCode::FORBIDDEN
             || response.status() == StatusCode::UNAUTHORIZED
         {
@@ -482,7 +506,7 @@ impl BaiduClient {
             }
             request
         };
-        let response = build(&self.http).send().await?;
+        let response = build(&self.transfer_http).send().await?;
         if response.status() == StatusCode::FORBIDDEN
             || response.status() == StatusCode::UNAUTHORIZED
         {
@@ -598,7 +622,12 @@ impl BaiduClient {
             .mime_str("application/octet-stream")
             .map_err(ApiError::Network)?;
         let form = reqwest::multipart::Form::new().part("uploadedfile", part);
-        let response = self.http.post(upload_url).multipart(form).send().await?;
+        let response = self
+            .transfer_http
+            .post(upload_url)
+            .multipart(form)
+            .send()
+            .await?;
         let value = self.parse_response(response, "上传分片").await?;
         let md5 = value
             .get("md5")
@@ -641,9 +670,93 @@ impl BaiduClient {
         Ok(url)
     }
 
-    async fn get_value(&self, url: Url, context: &str) -> Result<Value, ApiError> {
+    /// Fetch `bdstoken` required by web share/group transfer endpoints.
+    pub async fn bdstoken(&self) -> Result<String, ApiError> {
+        let mut url = Url::parse(&format!("{PAN_BASE}/api/gettemplatevariable"))?;
+        url.query_pairs_mut().append_pair(
+            "fields",
+            r#"["bdstoken","token","uk","isdocuser","servertime"]"#,
+        );
+        let value = self.get_value(url, "获取 bdstoken").await?;
+        let token = value
+            .get("result")
+            .and_then(|res| res.get("bdstoken"))
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .trim()
+            .to_string();
+        if token.is_empty() {
+            return Err(ApiError::Parse {
+                context: "获取 bdstoken".to_string(),
+                message: "响应缺少 bdstoken，请检查账号 Cookie 是否有效".to_string(),
+            });
+        }
+        Ok(token)
+    }
+
+    pub(crate) async fn get_value(&self, url: Url, context: &str) -> Result<Value, ApiError> {
         let response = self.http.get(url).send().await?;
         self.parse_response(response, context).await
+    }
+
+    pub(crate) async fn get_value_with_cookie(
+        &self,
+        url: Url,
+        context: &str,
+        extra_cookie: Option<&str>,
+    ) -> Result<Value, ApiError> {
+        let mut request = self
+            .http
+            .get(url)
+            .header(USER_AGENT, self.browser_ua())
+            .header(REFERER, "https://pan.baidu.com/");
+        if let Some(extra) = extra_cookie.filter(|s| !s.is_empty()) {
+            let combined = format!("{}; {extra}", self.account.cookie_header());
+            request = request.header(COOKIE, combined);
+        }
+        let response = request.send().await?;
+        self.parse_response(response, context).await
+    }
+
+    pub(crate) async fn get_text_with_cookie(
+        &self,
+        url: Url,
+        context: &str,
+        extra_cookie: Option<&str>,
+    ) -> Result<String, ApiError> {
+        let mut request = self
+            .http
+            .get(url)
+            .header(USER_AGENT, self.browser_ua())
+            .header(REFERER, "https://pan.baidu.com/")
+            .header(
+                reqwest::header::ACCEPT,
+                "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            );
+        if let Some(extra) = extra_cookie.filter(|s| !s.is_empty()) {
+            let combined = format!("{}; {extra}", self.account.cookie_header());
+            request = request.header(COOKIE, combined);
+        }
+        let response = request.send().await?;
+        let status = response.status();
+        let final_url = response.url().clone();
+        let text = response.text().await?;
+        tracing::debug!(
+            context,
+            %status,
+            %final_url,
+            body_len = text.len(),
+            "HTTP GET text response"
+        );
+        if !status.is_success() {
+            return Err(ApiError::Remote {
+                errno: -1,
+                message: format!("HTTP {status}"),
+                request_id: None,
+                context: context.to_string(),
+            });
+        }
+        Ok(text)
     }
 
     async fn post_value(
@@ -669,7 +782,28 @@ impl BaiduClient {
         context: &str,
         fields: &[(&str, String)],
     ) -> Result<Value, ApiError> {
-        let response = self.http.post(url).form(fields).send().await?;
+        self.post_form_value_with_cookie(url, context, fields, None)
+            .await
+    }
+
+    pub(crate) async fn post_form_value_with_cookie(
+        &self,
+        url: Url,
+        context: &str,
+        fields: &[(&str, String)],
+        extra_cookie: Option<&str>,
+    ) -> Result<Value, ApiError> {
+        let mut request = self
+            .http
+            .post(url)
+            .header(USER_AGENT, self.browser_ua())
+            .header(REFERER, "https://pan.baidu.com/")
+            .form(fields);
+        if let Some(extra) = extra_cookie.filter(|s| !s.is_empty()) {
+            let combined = format!("{}; {extra}", self.account.cookie_header());
+            request = request.header(COOKIE, combined);
+        }
+        let response = request.send().await?;
         self.parse_response(response, context).await
     }
 
@@ -698,7 +832,7 @@ impl BaiduClient {
     }
 }
 
-fn check_remote(value: &Value, context: &str) -> Result<(), ApiError> {
+pub(crate) fn check_remote(value: &Value, context: &str) -> Result<(), ApiError> {
     if let Some(errno) = value.get("errno").and_then(Value::as_i64) {
         if errno != 0 {
             return Err(ApiError::Remote {
@@ -711,6 +845,7 @@ fn check_remote(value: &Value, context: &str) -> Result<(), ApiError> {
                 context: context.to_string(),
             });
         }
+        return Ok(());
     }
     if let Some(status) = value.get("status").and_then(Value::as_i64) {
         if status != 0 {
@@ -788,20 +923,27 @@ fn truncate(text: &str, max: usize) -> String {
     format!("{}…", &text[..end])
 }
 
-// Keep these imports used in tests / future fallbacks without warnings.
-#[allow(dead_code)]
-fn _status_ok(status: StatusCode) -> bool {
-    status.is_success()
-}
-
-#[allow(dead_code)]
-fn _deserialize<T: DeserializeOwned>(value: Value) -> Result<T, serde_json::Error> {
-    serde_json::from_value(value)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn check_remote_prioritizes_errno_zero_over_business_status() {
+        let ok = json!({ "errno": 0, "status": 1, "list": [] });
+        assert!(check_remote(&ok, "测试").is_ok());
+
+        let err_errno = json!({ "errno": -9, "errmsg": "not found" });
+        assert!(matches!(
+            check_remote(&err_errno, "测试"),
+            Err(ApiError::Remote { errno: -9, .. })
+        ));
+
+        let err_status = json!({ "status": 2, "message": "failed" });
+        assert!(matches!(
+            check_remote(&err_status, "测试"),
+            Err(ApiError::Remote { errno: 2, .. })
+        ));
+    }
 
     #[test]
     fn identifies_expired_upload_id() {

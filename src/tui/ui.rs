@@ -70,7 +70,7 @@ fn draw_header(frame: &mut Frame, area: Rect, app: &App) {
         Span::styled("传输 ", Style::default().fg(MUTED)),
         Span::styled(transfers, Style::default().fg(WARN)),
     ]);
-    let remote = app.remote.title_path();
+    let remote = clean_name(&app.remote.title_path());
     let mode = match app.focus {
         Focus::Local => "本地",
         Focus::Remote => "远程",
@@ -83,7 +83,7 @@ fn draw_header(frame: &mut Frame, area: Rect, app: &App) {
         Span::raw("   "),
         Span::styled("本地 ", Style::default().fg(MUTED)),
         Span::styled(
-            app.local.cwd.display().to_string(),
+            clean_name(&app.local.cwd.display().to_string()),
             Style::default().fg(Color::White),
         ),
     ]);
@@ -127,9 +127,9 @@ fn pane_block(title: String, focused: bool) -> Block<'static> {
 }
 
 fn draw_local(frame: &mut Frame, area: Rect, app: &mut App) {
-    let mut title = format!(" 本地  {} ", app.local.cwd.display());
+    let mut title = format!(" 本地  {} ", clean_name(&app.local.cwd.display().to_string()));
     if !app.local.filter.is_empty() {
-        title.push_str(&format!("[filter: {}] ", app.local.filter));
+        title.push_str(&format!("[filter: {}] ", clean_name(&app.local.filter)));
     }
     if app.local.show_hidden {
         title.push_str("[隐藏文件] ");
@@ -147,6 +147,7 @@ fn draw_local(frame: &mut Frame, area: Rect, app: &mut App) {
         );
         return;
     }
+    let show_time = inner.width >= 60;
     let indices = app.local.visible_indices();
     let rows = indices
         .iter()
@@ -173,7 +174,7 @@ fn draw_local(frame: &mut Frame, area: Rect, app: &mut App) {
             } else {
                 format_bytes(entry.size)
             };
-            Row::new(vec![
+            let mut cells = vec![
                 Cell::from(quick_index(position)).style(Style::default().fg(ACCENT_DIM)),
                 Cell::from(name),
                 Cell::from(kind).style(Style::default().fg(if entry.is_dir {
@@ -182,8 +183,11 @@ fn draw_local(frame: &mut Frame, area: Rect, app: &mut App) {
                     MUTED
                 })),
                 Cell::from(size).style(Style::default().fg(MUTED)),
-                Cell::from(local_time(entry.modified)).style(Style::default().fg(MUTED)),
-            ])
+            ];
+            if show_time {
+                cells.push(Cell::from(local_time(entry.modified)).style(Style::default().fg(MUTED)));
+            }
+            Row::new(cells)
         })
         .collect::<Vec<_>>();
 
@@ -199,20 +203,36 @@ fn draw_local(frame: &mut Frame, area: Rect, app: &mut App) {
     app.local
         .table_state
         .select(Some(app.local.selected.min(rows.len() - 1)));
-    let table = Table::new(
-        rows,
-        [
-            Constraint::Length(3),
-            Constraint::Min(16),
-            Constraint::Length(5),
-            Constraint::Length(8),
-            Constraint::Length(16),
-        ],
-    )
-    .header(
-        Row::new(["#", "名称", "类型", "大小", "修改时间"])
-            .style(Style::default().fg(MUTED).add_modifier(Modifier::BOLD)),
-    )
+    let table = if show_time {
+        Table::new(
+            rows,
+            [
+                Constraint::Length(3),
+                Constraint::Min(16),
+                Constraint::Length(5),
+                Constraint::Length(8),
+                Constraint::Length(16),
+            ],
+        )
+        .header(
+            Row::new(["#", "名称", "类型", "大小", "修改时间"])
+                .style(Style::default().fg(MUTED).add_modifier(Modifier::BOLD)),
+        )
+    } else {
+        Table::new(
+            rows,
+            [
+                Constraint::Length(3),
+                Constraint::Min(16),
+                Constraint::Length(5),
+                Constraint::Length(8),
+            ],
+        )
+        .header(
+            Row::new(["#", "名称", "类型", "大小"])
+                .style(Style::default().fg(MUTED).add_modifier(Modifier::BOLD)),
+        )
+    }
     .row_highlight_style(
         Style::default()
             .bg(BG_SELECTED)
@@ -229,17 +249,18 @@ fn draw_remote(frame: &mut Frame, area: Rect, app: &mut App) {
     } else {
         String::new()
     };
-    let mut title = format!(" 远程  {}{} ", loading, app.remote.title_path());
+    let mut title = format!(" 远程  {}{} ", loading, clean_name(&app.remote.title_path()));
     if !app.remote.filter.is_empty() {
-        title.push_str(&format!("[filter: {}] ", app.remote.filter));
+        title.push_str(&format!("[filter: {}] ", clean_name(&app.remote.filter)));
     }
     let block = pane_block(title, app.focus == Focus::Remote);
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
     if let Some(error) = &app.remote.error {
+        let message = format!("{error}\n\n提示：r 重试 · Backspace 返回上级 · g 跳转路径");
         frame.render_widget(
-            Paragraph::new(error.as_str())
+            Paragraph::new(message)
                 .style(Style::default().fg(ERR))
                 .wrap(Wrap { trim: false }),
             inner,
@@ -255,6 +276,7 @@ fn draw_remote(frame: &mut Frame, area: Rect, app: &mut App) {
         );
         return;
     }
+    let show_time = inner.width >= 60;
     let search_mode = matches!(app.remote.mode, RemoteMode::Search { .. });
     let indices = app.remote.visible_indices();
     let rows = indices
@@ -270,12 +292,14 @@ fn draw_remote(frame: &mut Frame, area: Rect, app: &mut App) {
                 item.name.clone()
             };
             let name = format!("{}{}", if marked { "● " } else { "  " }, clean_name(&name));
-            let kind = if item.is_dir {
+            let kind = if matches!(app.remote.mode, RemoteMode::GroupList(_)) {
+                "GRP".to_string()
+            } else if item.is_dir {
                 "DIR".to_string()
             } else {
                 item.extension().to_ascii_uppercase()
             };
-            Row::new(vec![
+            let mut cells = vec![
                 Cell::from(quick_index(position)).style(Style::default().fg(ACCENT_DIM)),
                 Cell::from(name),
                 Cell::from(kind).style(Style::default().fg(if item.is_dir {
@@ -289,8 +313,11 @@ fn draw_remote(frame: &mut Frame, area: Rect, app: &mut App) {
                     format_bytes(item.size)
                 })
                 .style(Style::default().fg(MUTED)),
-                Cell::from(format_timestamp(item.mtime)).style(Style::default().fg(MUTED)),
-            ])
+            ];
+            if show_time {
+                cells.push(Cell::from(format_timestamp(item.mtime)).style(Style::default().fg(MUTED)));
+            }
+            Row::new(cells)
         })
         .collect::<Vec<_>>();
 
@@ -306,20 +333,36 @@ fn draw_remote(frame: &mut Frame, area: Rect, app: &mut App) {
     app.remote
         .table_state
         .select(Some(app.remote.selected.min(rows.len() - 1)));
-    let table = Table::new(
-        rows,
-        [
-            Constraint::Length(3),
-            Constraint::Min(18),
-            Constraint::Length(5),
-            Constraint::Length(8),
-            Constraint::Length(16),
-        ],
-    )
-    .header(
-        Row::new(["#", "名称", "类型", "大小", "修改时间"])
-            .style(Style::default().fg(MUTED).add_modifier(Modifier::BOLD)),
-    )
+    let table = if show_time {
+        Table::new(
+            rows,
+            [
+                Constraint::Length(3),
+                Constraint::Min(18),
+                Constraint::Length(5),
+                Constraint::Length(8),
+                Constraint::Length(16),
+            ],
+        )
+        .header(
+            Row::new(["#", "名称", "类型", "大小", "修改时间"])
+                .style(Style::default().fg(MUTED).add_modifier(Modifier::BOLD)),
+        )
+    } else {
+        Table::new(
+            rows,
+            [
+                Constraint::Length(3),
+                Constraint::Min(18),
+                Constraint::Length(5),
+                Constraint::Length(8),
+            ],
+        )
+        .header(
+            Row::new(["#", "名称", "类型", "大小"])
+                .style(Style::default().fg(MUTED).add_modifier(Modifier::BOLD)),
+        )
+    }
     .row_highlight_style(
         Style::default()
             .bg(BG_SELECTED)
@@ -332,7 +375,7 @@ fn draw_remote(frame: &mut Frame, area: Rect, app: &mut App) {
 
 fn draw_transfers(frame: &mut Frame, area: Rect, app: &mut App) {
     let title = format!(
-        " 传输队列  {}  ·  K 取消  ·  p 隐藏 ",
+        " 传输队列  {}  ·  K 取消 · R 重试 · c 清理 · p 隐藏 ",
         transfer_summary(&app.transfers)
     );
     let block = pane_block(title, app.focus == Focus::Transfers);
@@ -363,7 +406,7 @@ fn draw_transfers(frame: &mut Frame, area: Rect, app: &mut App) {
             Row::new(vec![
                 Cell::from(quick_index(position)).style(Style::default().fg(ACCENT_DIM)),
                 Cell::from(transfer.direction.arrow()).style(Style::default().fg(color)),
-                Cell::from(truncate(&transfer.name, 32)),
+                Cell::from(clean_name(&transfer.name)),
                 Cell::from(bar).style(Style::default().fg(color)),
                 Cell::from(format!(
                     "{}/{}",
@@ -409,13 +452,13 @@ fn draw_status(frame: &mut Frame, area: Rect, app: &App) {
     let color = if app.status.error { ERR } else { OK };
     let line1 = Line::from(vec![
         Span::styled(" ● ", Style::default().fg(color)),
-        Span::styled(app.status.text.clone(), Style::default().fg(color)),
+        Span::styled(clean_name(&app.status.text), Style::default().fg(color)),
     ]);
     frame.render_widget(Paragraph::new(line1).style(bg), chunks[0]);
 
     let metadata = Line::from(vec![
         Span::styled(" ◆ ", Style::default().fg(ACCENT_DIM)),
-        Span::styled(app.selected_metadata(), Style::default().fg(MUTED)),
+        Span::styled(clean_name(&app.selected_metadata()), Style::default().fg(MUTED)),
     ]);
     frame.render_widget(
         Paragraph::new(metadata).style(bg).wrap(Wrap { trim: true }),
@@ -424,10 +467,19 @@ fn draw_status(frame: &mut Frame, area: Rect, app: &App) {
 
     let hint = match app.focus {
         Focus::Local => "Enter 进入/上传 · u 上传 · x 删除 · / 过滤 · h 隐藏文件",
-        Focus::Remote => {
-            "Enter 进入/下载 · d 下载 · x 删除 · m/c 移动/复制 · R 重命名 · / 过滤 · f 搜索"
-        }
-        Focus::Transfers => "Enter/K 取消选中任务",
+        Focus::Remote => match app.remote.mode {
+            RemoteMode::Share(_) => {
+                "Enter 进入/下载 · t 转存网盘 · d 转存并下载 · Space 多选 · Backspace 上级 · Esc 退出"
+            }
+            RemoteMode::GroupList(_) => "Enter 进入群组 · / 过滤 · r 刷新 · Esc 返回个人网盘",
+            RemoteMode::GroupShare(_) => {
+                "Enter 进入/下载 · t 转存网盘 · d 转存并下载 · Space 多选 · Backspace 上级 · Esc 退出"
+            }
+            RemoteMode::Browse | RemoteMode::Search { .. } => {
+                "Enter 进入/下载 · d 下载 · S 分享链接 · G 群组 · x 删 · m/c 移/复 · f 搜索"
+            }
+        },
+        Focus::Transfers => "Enter/K 取消 · R 重试失败/取消 · c 清理已完成",
     };
     let line2 = Line::from(vec![
         Span::styled(" Tab ", Style::default().fg(Color::Black).bg(ACCENT_DIM)),
@@ -620,8 +672,8 @@ fn draw_help(frame: &mut Frame, area: Rect, app: &App) {
             Line::from(vec![key("x"), text("  删除选中项（需二次确认）")]),
             Line::from(vec![key("m / c"), text("  移动 / 复制远程选中项")]),
             Line::from(vec![key("R"), text("  重命名远程选中项")]),
-            Line::from(vec![key("n"), text("  新建远程目录")]),
-            Line::from(vec![key("g"), text("  跳转到远程绝对路径")]),
+            Line::from(vec![key("n / g"), text("  新建远程目录 / 跳转路径")]),
+            Line::from(vec![key("S / G / t"), text("  分享链接 / 群组文件 / 转存")]),
         ];
 
         let right = vec![
@@ -633,7 +685,7 @@ fn draw_help(frame: &mut Frame, area: Rect, app: &App) {
             Line::from(vec![key("r"), text("  刷新当前面板")]),
             Line::from(vec![key("p"), text("  显示 / 隐藏传输面板")]),
             Line::from(vec![key("C"), text("  配置与诊断面板")]),
-            Line::from(vec![key("K"), text("  取消选中的传输任务")]),
+            Line::from(vec![key("K / R / c"), text("  传输面板：取消 / 重试 / 清理")]),
             Line::from(vec![key("y"), text("  当前目录启动 Yazi")]),
             Line::from(vec![key("o"), text("  xdg-open 打开本地文件")]),
             Line::from(vec![key("?"), text("  打开 / 关闭帮助")]),
@@ -680,6 +732,8 @@ fn draw_help(frame: &mut Frame, area: Rect, app: &App) {
             Line::from(vec![key("R"), text("  重命名远程选中项（仅远程面板）")]),
             Line::from(vec![key("n"), text("  新建远程目录（仅远程面板）")]),
             Line::from(vec![key("g"), text("  跳转到远程绝对路径（仅远程面板）")]),
+            Line::from(vec![key("S / G"), text("  打开分享链接 / 浏览群组文件（仅远程面板）")]),
+            Line::from(vec![key("t / d"), text("  分享/群组视图：t 转存 · d 转存并下载")]),
             Line::from(vec![
                 key("Tab"),
                 text("  在跳转/移动/复制/新建/重命名输入框中补全远程路径"),
@@ -698,8 +752,8 @@ fn draw_help(frame: &mut Frame, area: Rect, app: &App) {
                 text("  配置与诊断（导出 / 导入 / 重新登录 / 检查）"),
             ]),
             Line::from(vec![
-                key("K"),
-                text("  取消传输面板中选中的任务（仅传输面板）"),
+                key("K / R / c"),
+                text("  取消 / 重试 / 清理传输任务（仅传输面板）"),
             ]),
             Line::from(vec![
                 key("y"),
@@ -742,6 +796,11 @@ fn draw_input(frame: &mut Frame, area: Rect, input: &crate::tui::app::InputState
         InputKind::Rename { .. } => "Tab 补全 · Enter 确认重命名 · Esc 取消",
         InputKind::MoveDest { .. } => "Tab 补全 · Enter 移动 · Esc 取消",
         InputKind::CopyDest { .. } => "Tab 补全 · Enter 复制 · Esc 取消",
+        InputKind::OpenShare => "Enter 解析分享链接 · Esc 取消",
+        InputKind::SharePassword { .. } => "Enter 提交提取码 · Esc 取消",
+        InputKind::SaveShareDest { .. } | InputKind::SaveGroupDest { .. } => {
+            "Tab 补全 · Enter 确认目标目录 · Esc 取消"
+        }
         InputKind::ExportConfig { redacted } => {
             if redacted {
                 "Enter 导出脱敏配置 · Esc 取消"
@@ -752,8 +811,8 @@ fn draw_input(frame: &mut Frame, area: Rect, input: &crate::tui::app::InputState
         InputKind::ImportConfig => "Enter 读取并在线验证 · Esc 取消",
     };
     let cursor = input.cursor.min(input.value.chars().count());
-    let before = input.value.chars().take(cursor).collect::<String>();
-    let after = input.value.chars().skip(cursor).collect::<String>();
+    let before = clean_name(&input.value.chars().take(cursor).collect::<String>());
+    let after = clean_name(&input.value.chars().skip(cursor).collect::<String>());
     let lines = vec![
         Line::from(Span::styled(
             input.prompt.clone(),
@@ -892,15 +951,6 @@ fn centered_rect_height(percent_x: u16, height: u16, area: Rect) -> Rect {
         Constraint::Percentage((100 - percent_x) / 2),
     ])
     .split(vertical[1])[1]
-}
-
-fn truncate(text: &str, max: usize) -> String {
-    if text.chars().count() <= max {
-        return text.to_string();
-    }
-    let mut result: String = text.chars().take(max.saturating_sub(1)).collect();
-    result.push('…');
-    result
 }
 
 /// File names come from the remote server and from the local filesystem.

@@ -116,24 +116,79 @@ impl UserInfo {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ApiListItem {
-    #[serde(default)]
+    #[serde(default, deserialize_with = "de_u64")]
     pub fs_id: u64,
     #[serde(default)]
     pub server_filename: String,
     #[serde(default)]
     pub path: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "de_u64")]
     pub size: u64,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "de_u8")]
     pub isdir: u8,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "de_i64")]
     pub server_mtime: i64,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "de_i64")]
     pub server_ctime: i64,
     #[serde(default)]
     pub md5: String,
     #[serde(default)]
     pub block_list: Vec<String>,
+}
+
+fn de_u64<'de, D>(deserializer: D) -> Result<u64, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum NumOrStr {
+        Num(u64),
+        Signed(i64),
+        Str(String),
+    }
+    match Option::<NumOrStr>::deserialize(deserializer)? {
+        Some(NumOrStr::Num(v)) => Ok(v),
+        Some(NumOrStr::Signed(v)) => Ok(v.max(0) as u64),
+        Some(NumOrStr::Str(s)) => Ok(s.trim().parse().unwrap_or(0)),
+        None => Ok(0),
+    }
+}
+
+fn de_i64<'de, D>(deserializer: D) -> Result<i64, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum NumOrStr {
+        Num(i64),
+        Str(String),
+    }
+    match Option::<NumOrStr>::deserialize(deserializer)? {
+        Some(NumOrStr::Num(v)) => Ok(v),
+        Some(NumOrStr::Str(s)) => Ok(s.trim().parse().unwrap_or(0)),
+        None => Ok(0),
+    }
+}
+
+fn de_u8<'de, D>(deserializer: D) -> Result<u8, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum NumOrStr {
+        Num(u64),
+        Bool(bool),
+        Str(String),
+    }
+    match Option::<NumOrStr>::deserialize(deserializer)? {
+        Some(NumOrStr::Num(v)) => Ok(v.min(u8::MAX as u64) as u8),
+        Some(NumOrStr::Bool(b)) => Ok(u8::from(b)),
+        Some(NumOrStr::Str(s)) => Ok(s.trim().parse().unwrap_or(0)),
+        None => Ok(0),
+    }
 }
 
 impl From<ApiListItem> for RemoteItem {

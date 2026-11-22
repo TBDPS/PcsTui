@@ -1,0 +1,26 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128" width="128" height="128">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%" stop-color="#141a21"/>
+      <stop offset="100%" stop-color="#1d2733"/>
+    </linearGradient>
+    <linearGradient id="accent" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%" stop-color="#5ac8fa"/>
+      <stop offset="100%" stop-color="#3298db"/>
+    </linearGradient>
+  </defs>
+  <rect x="8" y="8" width="112" height="112" rx="24" fill="url(#bg)" stroke="#2f4154" stroke-width="3"/>
+  <!-- Cloud silhouette -->
+  <path d="M42 54c-7.7 0-14-6-14-13.5 0-6.7 5-12.3 11.6-13.3C42.2 19.6 49.4 14 58 14c10.3 0 18.8 7.7 20 17.6 5.9.9 10.4 6 10.4 12.1 0 6.8-5.5 12.3-12.4 12.3H42z"
+        transform="translate(6 10)" fill="url(#accent)" opacity="0.95"/>
+  <!-- Dual-pane TUI frame -->
+  <rect x="24" y="70" width="36" height="34" rx="5" fill="#10151b" stroke="#5ac8fa" stroke-width="2.5"/>
+  <rect x="68" y="70" width="36" height="34" rx="5" fill="#10151b" stroke="#6edc96" stroke-width="2.5"/>
+  <!-- Pane rows -->
+  <line x1="30" y1="80" x2="54" y2="80" stroke="#5ac8fa" stroke-width="3" stroke-linecap="round"/>
+  <line x1="30" y1="88" x2="50" y2="88" stroke="#6c7a89" stroke-width="2.5" stroke-linecap="round"/>
+  <line x1="30" y1="96" x2="46" y2="96" stroke="#6c7a89" stroke-width="2.5" stroke-linecap="round"/>
+  <line x1="74" y1="80" x2="98" y2="80" stroke="#6edc96" stroke-width="3" stroke-linecap="round"/>
+  <line x1="74" y1="88" x2="94" y2="88" stroke="#6c7a89" stroke-width="2.5" stroke-linecap="round"/>
+  <line x1="74" y1="96" x2="90" y2="96" stroke="#6c7a89" stroke-width="2.5" stroke-linecap="round"/>
+</svg>

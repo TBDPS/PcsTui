@@ -607,19 +607,28 @@ async fn download_multi(
                                     index + 1
                                 )));
                             }
-                            wait_for_retry(attempt).await;
+                            if !wait_for_retry_or_cancel(attempt, &cancel).await {
+                                return Err(MultiFailure::Other(anyhow!("下载已取消")));
+                            }
                             continue;
                         }
                     };
                     let status = response.status();
-                    // Some accounts/sessions are not allowed to use multiple
-                    // Range requests even though the signed URL accepts a
-                    // probe. Treat that as "fall back to a single stream"
-                    // instead of failing the whole transfer.
-                    if status == reqwest::StatusCode::OK
-                        || status == reqwest::StatusCode::FORBIDDEN
+                    if status == reqwest::StatusCode::OK {
+                        return Err(MultiFailure::Unsupported);
+                    }
+                    // Signed download URLs can expire mid-transfer on huge files.
+                    // Refresh the link once via retry before concluding multi-range
+                    // is blocked for this account/file.
+                    if status == reqwest::StatusCode::FORBIDDEN
                         || status == reqwest::StatusCode::UNAUTHORIZED
                     {
+                        if attempt == 0 && retries > 0 {
+                            if !wait_for_retry_or_cancel(attempt, &cancel).await {
+                                return Err(MultiFailure::Other(anyhow!("下载已取消")));
+                            }
+                            continue;
+                        }
                         return Err(MultiFailure::Unsupported);
                     }
                     if status != reqwest::StatusCode::PARTIAL_CONTENT {
@@ -632,7 +641,9 @@ async fn download_multi(
                                 truncate(&body, 160)
                             )));
                         }
-                        wait_for_retry(attempt).await;
+                        if !wait_for_retry_or_cancel(attempt, &cancel).await {
+                            return Err(MultiFailure::Other(anyhow!("下载已取消")));
+                        }
                         continue;
                     }
                     let mut file = match tokio::fs::OpenOptions::new().write(true).open(&part).await
@@ -697,7 +708,9 @@ async fn download_multi(
                                     .unwrap_or_default()
                             )));
                         }
-                        wait_for_retry(attempt).await;
+                        if !wait_for_retry_or_cancel(attempt, &cancel).await {
+                            return Err(MultiFailure::Other(anyhow!("下载已取消")));
+                        }
                         continue;
                     }
                     if let Err(err) = file.flush().await {
@@ -715,13 +728,12 @@ async fn download_multi(
                         )));
                     }
                     drop(file);
-                    let fingerprint = part_fingerprint(&part).await;
                     let chunk_md5 = hex::encode(chunk_hasher.finalize());
                     {
                         let mut guard = state.lock().await;
                         guard.completed[index] = true;
                         guard.chunk_md5[index] = Some(chunk_md5);
-                        if let Some((len, mtime)) = fingerprint {
+                        if let Some((len, mtime)) = part_fingerprint(&part).await {
                             guard.part_len = len;
                             guard.part_mtime_ns = mtime;
                         }
@@ -800,7 +812,9 @@ async fn download_single(
                         format!("获取下载链接重试 {}/{}", failures, options.retries),
                     );
                 }
-                wait_for_retry(failures - 1).await;
+                if !wait_for_retry_or_cancel(failures - 1, cancel).await {
+                    bail!("下载已取消");
+                }
                 continue;
             }
         };
@@ -823,7 +837,9 @@ async fn download_single(
                             format!("下载请求重试 {}/{}", failures, options.retries),
                         );
                     }
-                    wait_for_retry(failures - 1).await;
+                    if !wait_for_retry_or_cancel(failures - 1, cancel).await {
+                        bail!("下载已取消");
+                    }
                     continue;
                 }
             }
@@ -841,7 +857,9 @@ async fn download_single(
                             format!("下载请求重试 {}/{}", failures, options.retries),
                         );
                     }
-                    wait_for_retry(failures - 1).await;
+                    if !wait_for_retry_or_cancel(failures - 1, cancel).await {
+                        bail!("下载已取消");
+                    }
                     continue;
                 }
             }
@@ -857,7 +875,7 @@ async fn download_single(
         if !status.is_success() {
             let body = response.text().await.unwrap_or_default();
             failures += 1;
-            if failures < max_failures && is_retryable_status(status) {
+            if failures < max_failures && is_retryable_download_status(status) {
                 if let Some(reporter) = reporter.as_deref_mut() {
                     reporter.set_status(
                         TransferStatus::Running,
@@ -869,7 +887,9 @@ async fn download_single(
                         ),
                     );
                 }
-                wait_for_retry(failures - 1).await;
+                if !wait_for_retry_or_cancel(failures - 1, cancel).await {
+                    bail!("下载已取消");
+                }
                 continue;
             }
             bail!(
@@ -918,7 +938,9 @@ async fn download_single(
                         ),
                     );
                 }
-                wait_for_retry(failures - 1).await;
+                if !wait_for_retry_or_cancel(failures - 1, cancel).await {
+                    bail!("下载已取消");
+                }
                 continue;
             }
             bail!(
@@ -1004,6 +1026,14 @@ fn is_retryable_status(status: reqwest::StatusCode) -> bool {
     status == reqwest::StatusCode::REQUEST_TIMEOUT
         || status == reqwest::StatusCode::TOO_MANY_REQUESTS
         || status.is_server_error()
+}
+
+/// Single-stream downloads re-fetch `download_link` on every loop iteration,
+/// so 401/403 (e.g. an expired signed URL) is also worth retrying.
+fn is_retryable_download_status(status: reqwest::StatusCode) -> bool {
+    is_retryable_status(status)
+        || status == reqwest::StatusCode::FORBIDDEN
+        || status == reqwest::StatusCode::UNAUTHORIZED
 }
 
 #[allow(clippy::needless_option_as_deref)]
@@ -1277,6 +1307,16 @@ pub async fn download_plan(
 pub async fn wait_for_retry(attempt: usize) {
     let delay = Duration::from_millis(300 * (1_u64 << attempt.min(5)));
     tokio::time::sleep(delay).await;
+}
+
+/// Sleep for the exponential backoff interval unless `cancel` fires first.
+/// Returns `true` if the full backoff elapsed, `false` if cancelled.
+pub async fn wait_for_retry_or_cancel(attempt: usize, cancel: &CancellationToken) -> bool {
+    let delay = Duration::from_millis(300 * (1_u64 << attempt.min(5)));
+    tokio::select! {
+        _ = cancel.cancelled() => false,
+        _ = tokio::time::sleep(delay) => true,
+    }
 }
 
 pub fn describe_api_error(err: &ApiError) -> String {

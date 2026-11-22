@@ -202,12 +202,15 @@ impl TransferEngine {
                 reporter.set_totals(total_bytes, files);
                 let mut base_done = 0_u64;
                 let mut file_index = 0usize;
+                let mut ensured_dirs = std::collections::HashSet::new();
                 for (path, dir, _) in &plan {
                     if cancel.is_cancelled() {
                         return Err(anyhow::anyhow!("上传已取消"));
                     }
                     if path.as_os_str().is_empty() {
-                        ensure_remote_dir(&client, dir).await?;
+                        if ensured_dirs.insert(dir.clone()) {
+                            ensure_remote_dir(&client, dir).await?;
+                        }
                         continue;
                     }
                     let size = std::fs::metadata(path).map(|meta| meta.len()).unwrap_or(0);
@@ -224,6 +227,7 @@ impl TransferEngine {
                         &mut reporter,
                     )
                     .await?;
+                    ensured_dirs.insert(dir.clone());
                     base_done = base_done.saturating_add(size);
                     file_index += 1;
                     reporter.update_files(

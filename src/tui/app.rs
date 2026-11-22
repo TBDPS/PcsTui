@@ -8,9 +8,16 @@ use ratatui::widgets::TableState;
 use tokio::sync::mpsc::UnboundedSender;
 
 use crate::api::BaiduClient;
+use crate::api::group::{
+    GroupInfo, GroupShareEntry, list_group_dir, list_group_shares, list_groups,
+    transfer_group_files,
+};
 use crate::api::models::{
-    Quota, RemoteItem, SortMode, UserInfo, format_bytes, format_timestamp, normalize_remote,
-    remote_join, remote_parent, sanitize_component,
+    Quota, RemoteItem, UserInfo, format_bytes, format_timestamp, normalize_remote, remote_join,
+    remote_parent, sanitize_component,
+};
+use crate::api::share::{
+    ShareInput, ShareSession, list_share_dir, open_share, parse_share_input, transfer_share,
 };
 use crate::config::{RuntimeConfig, expand_tilde, home_dir};
 use crate::transfer::types::{
@@ -18,6 +25,13 @@ use crate::transfer::types::{
 };
 use crate::transfer::{QueueStore, QueuedTask, QueuedTaskKind, TransferEngine};
 use crate::tui::config_panel::ConfigPanel;
+pub use crate::tui::modal::{
+    ConfirmAction, ConfirmState, GroupTransferBatch, InputKind, InputState, StatusMessage,
+};
+pub use crate::tui::panes::{
+    GroupDirLevel, GroupSessionState, LocalEntry, LocalPane, RemoteMode, RemotePane, RemoteRef,
+    ShareSessionState, remote_ref_matches, verify_remote_refs,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Focus {
@@ -59,6 +73,39 @@ pub enum AppEvent {
         items: Vec<RemoteItem>,
         error: Option<String>,
     },
+    ShareOpened {
+        generation: u64,
+        input: ShareInput,
+        result: Result<(ShareSession, Vec<RemoteItem>), String>,
+    },
+    ShareDirLoaded {
+        generation: u64,
+        dir: String,
+        items: Vec<RemoteItem>,
+        error: Option<String>,
+    },
+    GroupListLoaded {
+        generation: u64,
+        groups: Vec<GroupInfo>,
+        error: Option<String>,
+    },
+    GroupSharesLoaded {
+        generation: u64,
+        group: GroupInfo,
+        shares: Vec<GroupShareEntry>,
+        error: Option<String>,
+    },
+    GroupDirLoaded {
+        generation: u64,
+        level: GroupDirLevel,
+        items: Vec<RemoteItem>,
+        error: Option<String>,
+    },
+    ExternalSavedForDownload {
+        dest: String,
+        items: Vec<RemoteItem>,
+        error: Option<String>,
+    },
     Quota(Result<Quota, String>),
     User(Result<UserInfo, String>),
     TaskDone {
@@ -81,451 +128,6 @@ pub enum AppEvent {
     ConfigImportFailed {
         message: String,
     },
-}
-
-#[derive(Debug, Clone)]
-pub struct LocalEntry {
-    pub path: PathBuf,
-    pub name: String,
-    pub is_dir: bool,
-    pub size: u64,
-    pub modified: Option<SystemTime>,
-    pub is_symlink: bool,
-}
-
-pub struct LocalPane {
-    pub cwd: PathBuf,
-    pub entries: Vec<LocalEntry>,
-    pub selected: usize,
-    pub filter: String,
-    pub show_hidden: bool,
-    pub error: Option<String>,
-    pub table_state: TableState,
-}
-
-impl LocalPane {
-    pub fn new(cwd: PathBuf) -> Self {
-        Self {
-            cwd,
-            entries: Vec::new(),
-            selected: 0,
-            filter: String::new(),
-            show_hidden: false,
-            error: None,
-            table_state: TableState::default(),
-        }
-    }
-
-    pub fn reload(&mut self) {
-        self.error = None;
-        let read = match std::fs::read_dir(&self.cwd) {
-            Ok(read) => read,
-            Err(err) => {
-                self.entries.clear();
-                self.error = Some(format!("读取本地目录失败: {err}"));
-                return;
-            }
-        };
-        let mut entries = Vec::new();
-        for entry in read.flatten() {
-            let path = entry.path();
-            let name = entry.file_name().to_string_lossy().to_string();
-            let metadata = match std::fs::symlink_metadata(&path) {
-                Ok(metadata) => metadata,
-                Err(_) => continue,
-            };
-            let is_symlink = metadata.file_type().is_symlink();
-            let followed = if is_symlink {
-                std::fs::metadata(&path).ok()
-            } else {
-                Some(metadata.clone())
-            };
-            let is_dir = followed.as_ref().map(|meta| meta.is_dir()).unwrap_or(false);
-            let size = followed.as_ref().map(|meta| meta.len()).unwrap_or(0);
-            let modified = metadata.modified().ok();
-            entries.push(LocalEntry {
-                path,
-                name,
-                is_dir,
-                size,
-                modified,
-                is_symlink,
-            });
-        }
-        entries.sort_by(|a, b| {
-            b.is_dir
-                .cmp(&a.is_dir)
-                .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
-        });
-        self.entries = entries;
-        self.clamp_selection();
-    }
-
-    pub fn visible_indices(&self) -> Vec<usize> {
-        let needle = self.filter.to_lowercase();
-        self.entries
-            .iter()
-            .enumerate()
-            .filter(|(_, entry)| {
-                (self.show_hidden || !entry.name.starts_with('.'))
-                    && (needle.is_empty() || entry.name.to_lowercase().contains(&needle))
-            })
-            .map(|(index, _)| index)
-            .collect()
-    }
-
-    pub fn visible_len(&self) -> usize {
-        self.visible_indices().len()
-    }
-
-    pub fn current(&self) -> Option<&LocalEntry> {
-        let index = *self.visible_indices().get(self.selected)?;
-        self.entries.get(index)
-    }
-
-    pub fn marked_or_current(&self, marked: &HashSet<PathBuf>) -> Vec<LocalEntry> {
-        if marked.is_empty() {
-            return self.current().cloned().into_iter().collect();
-        }
-        self.entries
-            .iter()
-            .filter(|entry| marked.contains(&entry.path))
-            .cloned()
-            .collect()
-    }
-
-    pub fn clamp_selection(&mut self) {
-        let len = self.visible_len();
-        if len == 0 {
-            self.selected = 0;
-        } else if self.selected >= len {
-            self.selected = len - 1;
-        }
-    }
-
-    pub fn parent(&self) -> Option<PathBuf> {
-        self.cwd.parent().map(Path::to_path_buf)
-    }
-}
-
-#[derive(Debug, Clone)]
-pub enum RemoteMode {
-    Browse,
-    Search { keyword: String, base: String },
-}
-
-pub struct RemotePane {
-    pub cwd: String,
-    pub entries: Vec<RemoteItem>,
-    pub selected: usize,
-    pub filter: String,
-    pub sort: SortMode,
-    pub loading: bool,
-    pub error: Option<String>,
-    pub mode: RemoteMode,
-    pub table_state: TableState,
-}
-
-impl RemotePane {
-    pub fn new(cwd: String) -> Self {
-        Self {
-            cwd,
-            entries: Vec::new(),
-            selected: 0,
-            filter: String::new(),
-            sort: SortMode::NameAsc,
-            loading: false,
-            error: None,
-            mode: RemoteMode::Browse,
-            table_state: TableState::default(),
-        }
-    }
-
-    pub fn visible_indices(&self) -> Vec<usize> {
-        let needle = self.filter.to_lowercase();
-        self.entries
-            .iter()
-            .enumerate()
-            .filter(|(_, entry)| needle.is_empty() || entry.name.to_lowercase().contains(&needle))
-            .map(|(index, _)| index)
-            .collect()
-    }
-
-    pub fn visible_len(&self) -> usize {
-        self.visible_indices().len()
-    }
-
-    pub fn current(&self) -> Option<&RemoteItem> {
-        let index = *self.visible_indices().get(self.selected)?;
-        self.entries.get(index)
-    }
-
-    pub fn marked_or_current(&self, marked: &HashMap<String, RemoteRef>) -> Vec<RemoteItem> {
-        if marked.is_empty() {
-            return self.current().cloned().into_iter().collect();
-        }
-        self.entries
-            .iter()
-            .filter(|item| marked.contains_key(&item.absolute_path(&self.cwd)))
-            .cloned()
-            .collect()
-    }
-
-    pub fn sort_entries(&mut self) {
-        self.sort.sort(&mut self.entries);
-    }
-
-    pub fn clamp_selection(&mut self) {
-        let len = self.visible_len();
-        if len == 0 {
-            self.selected = 0;
-        } else if self.selected >= len {
-            self.selected = len - 1;
-        }
-    }
-
-    pub fn title_path(&self) -> String {
-        match &self.mode {
-            RemoteMode::Browse => self.cwd.clone(),
-            RemoteMode::Search { keyword, base } => format!("搜索 “{keyword}” @ {base}"),
-        }
-    }
-}
-
-/// Stable identity for a remote item while it is selected for a destructive
-/// action. Paths alone are not identity: the server may reuse a path for a
-/// different file between the listing and the confirmation.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct RemoteRef {
-    pub fs_id: u64,
-    pub path: String,
-    pub name: String,
-    pub is_dir: bool,
-}
-
-impl RemoteRef {
-    pub fn from_item(item: &RemoteItem, cwd: &str) -> Self {
-        Self {
-            fs_id: item.fs_id,
-            path: item.absolute_path(cwd),
-            name: item.name.clone(),
-            is_dir: item.is_dir,
-        }
-    }
-}
-
-fn remote_ref_matches(reference: &RemoteRef, current: &RemoteItem) -> bool {
-    reference.fs_id != 0
-        && current.fs_id == reference.fs_id
-        && current.is_dir == reference.is_dir
-        && current.name == reference.name
-}
-
-/// Re-check every selected item immediately before a destructive remote call.
-/// If any item changed or vanished, the whole batch is aborted. Partial
-/// deletion based on stale paths is worse than making the user refresh.
-async fn verify_remote_refs(client: &BaiduClient, refs: &[RemoteRef]) -> Result<(), String> {
-    for reference in refs {
-        if reference.fs_id == 0 {
-            return Err(format!(
-                "无法确认远程项目身份（缺少 fs_id）：{}；请刷新后重试",
-                reference.path
-            ));
-        }
-        let current = client
-            .stat(&reference.path)
-            .await
-            .map_err(|err| format!("无法确认远程项目 {}: {err}", reference.path))?;
-        if !remote_ref_matches(reference, &current) {
-            return Err(format!(
-                "远程项目已变化：{}（原 fs_id {}，当前 fs_id {}）",
-                reference.path, reference.fs_id, current.fs_id
-            ));
-        }
-    }
-    Ok(())
-}
-
-#[derive(Debug, Clone)]
-pub enum InputKind {
-    FilterLocal,
-    FilterRemote,
-    Search,
-    Mkdir,
-    Goto,
-    Rename { from: RemoteRef },
-    MoveDest { sources: Vec<RemoteRef> },
-    CopyDest { sources: Vec<RemoteRef> },
-    ExportConfig { redacted: bool },
-    ImportConfig,
-}
-
-pub struct InputState {
-    pub title: String,
-    pub prompt: String,
-    pub value: String,
-    /// Cursor position in Unicode scalar values (not bytes).
-    pub cursor: usize,
-    pub kind: InputKind,
-}
-
-impl InputState {
-    pub fn new(
-        title: impl Into<String>,
-        prompt: impl Into<String>,
-        value: String,
-        kind: InputKind,
-    ) -> Self {
-        let cursor = value.chars().count();
-        Self {
-            title: title.into(),
-            prompt: prompt.into(),
-            value,
-            cursor,
-            kind,
-        }
-    }
-
-    fn set_value(&mut self, value: String) {
-        self.cursor = value.chars().count();
-        self.value = value;
-    }
-
-    fn char_count(&self) -> usize {
-        self.value.chars().count()
-    }
-
-    fn insert(&mut self, ch: char) {
-        let byte = char_to_byte(&self.value, self.cursor);
-        self.value.insert(byte, ch);
-        self.cursor += 1;
-    }
-
-    fn insert_text(&mut self, text: &str) {
-        for ch in text.chars().filter(|ch| !ch.is_control() || *ch == '\t') {
-            self.insert(ch);
-        }
-    }
-
-    fn backspace(&mut self) {
-        if self.cursor == 0 {
-            return;
-        }
-        let end = char_to_byte(&self.value, self.cursor);
-        let start = char_to_byte(&self.value, self.cursor - 1);
-        self.value.replace_range(start..end, "");
-        self.cursor -= 1;
-    }
-
-    fn delete(&mut self) {
-        if self.cursor >= self.char_count() {
-            return;
-        }
-        let start = char_to_byte(&self.value, self.cursor);
-        let end = char_to_byte(&self.value, self.cursor + 1);
-        self.value.replace_range(start..end, "");
-    }
-
-    fn move_left(&mut self) {
-        self.cursor = self.cursor.saturating_sub(1);
-    }
-
-    fn move_right(&mut self) {
-        self.cursor = (self.cursor + 1).min(self.char_count());
-    }
-
-    fn home(&mut self) {
-        self.cursor = 0;
-    }
-
-    fn end(&mut self) {
-        self.cursor = self.char_count();
-    }
-
-    fn move_word_left(&mut self) {
-        let chars: Vec<char> = self.value.chars().collect();
-        let mut index = self.cursor;
-        while index > 0 && chars[index - 1].is_whitespace() {
-            index -= 1;
-        }
-        while index > 0 && !chars[index - 1].is_whitespace() {
-            index -= 1;
-        }
-        self.cursor = index;
-    }
-
-    fn move_word_right(&mut self) {
-        let chars: Vec<char> = self.value.chars().collect();
-        let mut index = self.cursor;
-        while index < chars.len() && chars[index].is_whitespace() {
-            index += 1;
-        }
-        while index < chars.len() && !chars[index].is_whitespace() {
-            index += 1;
-        }
-        self.cursor = index;
-    }
-
-    fn delete_word_left(&mut self) {
-        let old = self.cursor;
-        self.move_word_left();
-        let start = char_to_byte(&self.value, self.cursor);
-        let end = char_to_byte(&self.value, old);
-        self.value.replace_range(start..end, "");
-    }
-
-    fn delete_to_start(&mut self) {
-        let end = char_to_byte(&self.value, self.cursor);
-        self.value.replace_range(..end, "");
-        self.cursor = 0;
-    }
-
-    fn delete_to_end(&mut self) {
-        let start = char_to_byte(&self.value, self.cursor);
-        self.value.truncate(start);
-    }
-}
-
-fn char_to_byte(value: &str, char_index: usize) -> usize {
-    value
-        .char_indices()
-        .nth(char_index)
-        .map(|(byte, _)| byte)
-        .unwrap_or(value.len())
-}
-
-#[derive(Debug, Clone)]
-pub enum ConfirmAction {
-    DeleteRemote(Vec<RemoteRef>),
-    DeleteLocal(Vec<PathBuf>),
-    ImportConfig {
-        candidate: Box<RuntimeConfig>,
-        source: PathBuf,
-    },
-    Relogin,
-    Quit,
-}
-
-pub struct ConfirmState {
-    pub title: String,
-    pub message: String,
-    pub action: ConfirmAction,
-}
-
-pub struct StatusMessage {
-    pub text: String,
-    pub error: bool,
-    pub at: std::time::Instant,
-}
-
-impl StatusMessage {
-    fn new(text: impl Into<String>, error: bool) -> Self {
-        Self {
-            text: text.into(),
-            error,
-            at: std::time::Instant::now(),
-        }
-    }
 }
 
 pub struct App {
@@ -559,6 +161,7 @@ pub struct App {
     pub tick: u64,
     pub queue: QueueStore,
     pub queue_ids: HashMap<u64, String>,
+    pub transfer_specs: HashMap<u64, QueuedTaskKind>,
     pub queue_error: Option<String>,
     pub quick_index: String,
     pub quick_at: Option<Instant>,
@@ -634,6 +237,7 @@ impl App {
             tick: 0,
             queue,
             queue_ids: HashMap::new(),
+            transfer_specs: HashMap::new(),
             queue_error,
             quick_index: String::new(),
             quick_at: None,
@@ -689,12 +293,14 @@ impl App {
     ) -> bool {
         let task = QueuedTask::download(item.clone(), cwd.clone(), dest.clone(), options.clone());
         let queue_id = task.id.clone();
+        let spec = task.task.clone();
         if !self.queue.add(task) {
             return false;
         }
         self.save_queue();
         let id = self.engine.spawn_download(item, cwd, dest, options);
         self.queue_ids.insert(id, queue_id);
+        self.transfer_specs.insert(id, spec);
         true
     }
 
@@ -706,12 +312,14 @@ impl App {
     ) -> bool {
         let task = QueuedTask::upload(local.clone(), remote_dir.clone(), options.clone());
         let queue_id = task.id.clone();
+        let spec = task.task.clone();
         if !self.queue.add(task) {
             return false;
         }
         self.save_queue();
         let id = self.engine.spawn_upload(local, remote_dir, options);
         self.queue_ids.insert(id, queue_id);
+        self.transfer_specs.insert(id, spec);
         true
     }
 
@@ -747,6 +355,7 @@ impl App {
                     .spawn_upload(local.clone(), remote_dir.clone(), options.clone()),
             };
             self.queue_ids.insert(id, task.id.clone());
+            self.transfer_specs.insert(id, task.task.clone());
         }
         if removed > 0 {
             self.set_status(
@@ -816,6 +425,9 @@ impl App {
             },
             Focus::Remote => match self.remote.current() {
                 Some(item) => {
+                    if matches!(self.remote.mode, RemoteMode::GroupList(_)) {
+                        return format!("群组 gid {} · {}", item.path, item.name);
+                    }
                     let path = item.absolute_path(&self.remote.cwd);
                     let md5 = if item.md5.is_empty() {
                         "-"
@@ -911,7 +523,214 @@ impl App {
                     self.remote.sort_entries();
                     self.remote.selected = 0;
                     self.remote.clamp_selection();
+                    self.marked_remote.clear();
                     self.set_status(format!("搜索完成：{} 项", self.remote.entries.len()), false);
+                }
+            }
+            AppEvent::ShareOpened {
+                generation,
+                input,
+                result,
+            } => {
+                if generation != self.generation {
+                    return;
+                }
+                self.remote.loading = false;
+                match result {
+                    Ok((session, items)) => {
+                        self.remote.error = None;
+                        let title = session.title.clone();
+                        self.remote.mode = RemoteMode::Share(ShareSessionState {
+                            session,
+                            dir: "/".to_string(),
+                        });
+                        self.remote.entries = items;
+                        self.remote.sort_entries();
+                        self.remote.selected = 0;
+                        self.remote.filter.clear();
+                        self.remote.clamp_selection();
+                        self.marked_remote.clear();
+                        self.set_status(
+                            format!("已打开分享 “{title}” · t 转存 · d 转存并下载 · Esc 返回"),
+                            false,
+                        );
+                    }
+                    Err(err) => {
+                        if input.pwd.is_none()
+                            && (err.contains("提取码") || err.contains("密码"))
+                        {
+                            self.set_status("该分享需要提取码", false);
+                            self.open_input(InputState::new(
+                                "输入分享提取码",
+                                format!("分享 {} 需要提取码", input.shorturl),
+                                String::new(),
+                                InputKind::SharePassword { input },
+                            ));
+                        } else {
+                            self.set_status(format!("打开分享失败: {err}"), true);
+                        }
+                    }
+                }
+            }
+            AppEvent::ShareDirLoaded {
+                generation,
+                dir,
+                items,
+                error,
+            } => {
+                if generation != self.generation {
+                    return;
+                }
+                self.remote.loading = false;
+                if let Some(error) = error {
+                    self.remote.error = Some(error.clone());
+                    self.set_status(error, true);
+                } else if let RemoteMode::Share(state) = &mut self.remote.mode {
+                    state.dir = dir;
+                    self.remote.error = None;
+                    self.remote.entries = items;
+                    self.remote.sort_entries();
+                    self.remote.selected = 0;
+                    self.remote.filter.clear();
+                    self.remote.clamp_selection();
+                    self.marked_remote.clear();
+                }
+            }
+            AppEvent::GroupListLoaded {
+                generation,
+                groups,
+                error,
+            } => {
+                if generation != self.generation {
+                    return;
+                }
+                self.remote.loading = false;
+                if let Some(error) = error {
+                    self.remote.error = Some(error.clone());
+                    self.remote.entries.clear();
+                    self.set_status(format!("获取群组列表失败: {error}"), true);
+                } else {
+                    self.remote.error = None;
+                    self.remote.entries = groups
+                        .iter()
+                        .map(|group| RemoteItem {
+                            fs_id: group.gid.parse().unwrap_or(0),
+                            name: format!("{} ({}人)", group.name, group.member_count),
+                            path: group.gid.clone(),
+                            is_dir: true,
+                            ..Default::default()
+                        })
+                        .collect();
+                    self.remote.mode = RemoteMode::GroupList(groups);
+                    self.remote.selected = 0;
+                    self.remote.filter.clear();
+                    self.remote.clamp_selection();
+                    self.marked_remote.clear();
+                    self.set_status(
+                        format!(
+                            "已加载 {} 个群组 · Enter 进入群组 · Esc 返回个人网盘",
+                            self.remote.entries.len()
+                        ),
+                        false,
+                    );
+                }
+            }
+            AppEvent::GroupSharesLoaded {
+                generation,
+                group,
+                shares,
+                error,
+            } => {
+                if generation != self.generation {
+                    return;
+                }
+                self.remote.loading = false;
+                if let Some(error) = error {
+                    self.remote.error = Some(error.clone());
+                    self.set_status(format!("加载群组文件失败: {error}"), true);
+                } else {
+                    self.remote.error = None;
+                    self.remote.entries = shares.iter().map(|entry| entry.item.clone()).collect();
+                    self.remote.mode = RemoteMode::GroupShare(GroupSessionState {
+                        group: group.clone(),
+                        shares,
+                        path_stack: Vec::new(),
+                    });
+                    self.remote.sort_entries();
+                    self.remote.selected = 0;
+                    self.remote.filter.clear();
+                    self.remote.clamp_selection();
+                    self.marked_remote.clear();
+                    self.set_status(
+                        format!(
+                            "群组 “{}”：{} 项 · t 转存 · d 转存并下载 · Backspace 返回",
+                            group.name,
+                            self.remote.entries.len()
+                        ),
+                        false,
+                    );
+                }
+            }
+            AppEvent::GroupDirLoaded {
+                generation,
+                level,
+                items,
+                error,
+            } => {
+                if generation != self.generation {
+                    return;
+                }
+                self.remote.loading = false;
+                if let Some(error) = error {
+                    self.remote.error = Some(error.clone());
+                    self.set_status(format!("列出群组目录失败: {error}"), true);
+                } else if let RemoteMode::GroupShare(state) = &mut self.remote.mode {
+                    if state
+                        .path_stack
+                        .last()
+                        .map(|top| top.fs_id != level.fs_id || top.dir != level.dir)
+                        .unwrap_or(true)
+                    {
+                        state.path_stack.push(level);
+                    }
+                    self.remote.error = None;
+                    self.remote.entries = items;
+                    self.remote.sort_entries();
+                    self.remote.selected = 0;
+                    self.remote.filter.clear();
+                    self.remote.clamp_selection();
+                    self.marked_remote.clear();
+                }
+            }
+            AppEvent::ExternalSavedForDownload { dest, items, error } => {
+                if let Some(error) = error {
+                    self.set_status(error, true);
+                    return;
+                }
+                if items.is_empty() {
+                    self.set_status(
+                        format!("已转存到 {dest}，但未能在目标目录定位到文件，请跳转查看"),
+                        true,
+                    );
+                    return;
+                }
+                let options = self.default_download_options();
+                let local_dest = self.local.cwd.clone();
+                let total = items.len();
+                let mut added = 0;
+                for item in items {
+                    if self.enqueue_download(item, dest.clone(), local_dest.clone(), options.clone())
+                    {
+                        added += 1;
+                    }
+                }
+                if added == 0 {
+                    self.set_status(format!("已转存到 {dest}（相同下载任务已在队列中）"), false);
+                } else {
+                    self.set_status(
+                        format!("已转存到 {dest} 并加入下载队列（{added}/{total} 项）"),
+                        false,
+                    );
                 }
             }
             AppEvent::Quota(result) => match result {
@@ -1030,6 +849,7 @@ impl App {
                     }
                 }
                 if completed {
+                    self.transfer_specs.remove(&transfer_id);
                     match direction {
                         Direction::Download => self.local.reload(),
                         Direction::Upload => self.refresh_remote(),
@@ -1149,16 +969,24 @@ impl App {
                     self.refresh_focused();
                 }
             }
-            KeyCode::Char('R') => {
-                if self.focus == Focus::Remote {
-                    self.start_rename();
-                } else {
-                    self.wrong_focus("重命名", "远程");
+            KeyCode::Char('R') => match self.focus {
+                Focus::Remote => {
+                    if self.remote.is_read_only() {
+                        self.read_only_notice();
+                    } else {
+                        self.start_rename();
+                    }
                 }
-            }
+                Focus::Transfers => self.retry_selected_transfer(),
+                Focus::Local => self.wrong_focus("重命名", "远程"),
+            },
             KeyCode::Char('n') => {
                 if self.focus == Focus::Remote {
-                    self.start_mkdir();
+                    if self.remote.is_read_only() {
+                        self.read_only_notice();
+                    } else {
+                        self.start_mkdir();
+                    }
                 } else {
                     self.wrong_focus("新建远程目录", "远程");
                 }
@@ -1172,9 +1000,39 @@ impl App {
             }
             KeyCode::Char('f') => {
                 if self.focus == Focus::Remote {
-                    self.start_search();
+                    if self.remote.is_read_only() {
+                        self.read_only_notice();
+                    } else {
+                        self.start_search();
+                    }
                 } else {
                     self.wrong_focus("搜索网盘", "远程");
+                }
+            }
+            KeyCode::Char('S') => {
+                if self.focus == Focus::Remote {
+                    self.start_open_share();
+                } else {
+                    self.wrong_focus("打开分享链接", "远程");
+                }
+            }
+            KeyCode::Char('G') => {
+                if self.focus == Focus::Remote {
+                    self.load_groups();
+                } else {
+                    self.wrong_focus("浏览群组文件", "远程");
+                }
+            }
+            KeyCode::Char('t') => {
+                if self.focus == Focus::Remote {
+                    match self.remote.mode {
+                        RemoteMode::Share(_) | RemoteMode::GroupShare(_) => {
+                            self.start_save_external(false);
+                        }
+                        _ => self.set_status("转存仅在分享或群组文件视图可用", true),
+                    }
+                } else {
+                    self.wrong_focus("转存", "远程");
                 }
             }
             KeyCode::Char('/') => {
@@ -1193,6 +1051,14 @@ impl App {
                 Focus::Local => {
                     self.local.show_hidden = !self.local.show_hidden;
                     self.local.clamp_selection();
+                    self.set_status(
+                        if self.local.show_hidden {
+                            "显示隐藏文件"
+                        } else {
+                            "隐藏隐藏文件"
+                        },
+                        false,
+                    );
                 }
                 Focus::Transfers => self.wrong_focus("排序", "远程"),
             },
@@ -1221,14 +1087,26 @@ impl App {
             }
             KeyCode::Char('d') => {
                 if self.focus == Focus::Remote {
-                    self.download_selected();
+                    match self.remote.mode {
+                        RemoteMode::Share(_) | RemoteMode::GroupShare(_) => {
+                            self.start_save_external(true);
+                        }
+                        RemoteMode::GroupList(_) => {
+                            self.set_status("请按 Enter 进入群组后再选择文件下载", true);
+                        }
+                        RemoteMode::Browse | RemoteMode::Search { .. } => self.download_selected(),
+                    }
                 } else {
                     self.wrong_focus("下载", "远程");
                 }
             }
             KeyCode::Char('u') => {
                 if self.focus == Focus::Local {
-                    self.upload_selected();
+                    if self.remote.is_read_only() {
+                        self.read_only_notice();
+                    } else {
+                        self.upload_selected();
+                    }
                 } else {
                     self.wrong_focus("上传", "本地");
                 }
@@ -1236,24 +1114,34 @@ impl App {
             KeyCode::Char('x') => {
                 if self.focus == Focus::Transfers {
                     self.wrong_focus("删除", "本地或远程");
+                } else if self.focus == Focus::Remote && self.remote.is_read_only() {
+                    self.read_only_notice();
                 } else {
                     self.delete_selected();
                 }
             }
             KeyCode::Char('m') => {
                 if self.focus == Focus::Remote {
-                    self.start_move();
+                    if self.remote.is_read_only() {
+                        self.read_only_notice();
+                    } else {
+                        self.start_move();
+                    }
                 } else {
                     self.wrong_focus("移动", "远程");
                 }
             }
-            KeyCode::Char('c') => {
-                if self.focus == Focus::Remote {
-                    self.start_copy();
-                } else {
-                    self.wrong_focus("复制", "远程");
+            KeyCode::Char('c') => match self.focus {
+                Focus::Remote => {
+                    if self.remote.is_read_only() {
+                        self.read_only_notice();
+                    } else {
+                        self.start_copy();
+                    }
                 }
-            }
+                Focus::Transfers => self.clear_finished_transfers(),
+                Focus::Local => self.wrong_focus("复制", "远程"),
+            },
             KeyCode::Char('K') => {
                 if self.focus == Focus::Transfers {
                     self.cancel_selected_transfer();
@@ -1281,6 +1169,10 @@ impl App {
 
     fn wrong_focus(&mut self, action: &str, expected: &str) {
         self.set_status(format!("{action}仅在{expected}面板可用"), true);
+    }
+
+    fn read_only_notice(&mut self) {
+        self.set_status("当前为分享/群组只读视图（按 Esc 返回个人网盘）", true);
     }
 
     fn open_config_panel(&mut self) {
@@ -1399,28 +1291,16 @@ impl App {
     fn execute_confirm(&mut self, action: ConfirmAction) {
         match action {
             ConfirmAction::DeleteRemote(refs) => {
-                let client = self.client.clone();
-                let tx = self.tx.clone();
                 let count = refs.len();
-                tokio::spawn(async move {
-                    let (message, error) = match verify_remote_refs(&client, &refs).await {
-                        Ok(()) => {
-                            let paths = refs
-                                .iter()
-                                .map(|reference| reference.path.clone())
-                                .collect::<Vec<_>>();
-                            match client.remove(&paths).await {
-                                Ok(()) => (format!("已删除 {count} 项"), false),
-                                Err(err) => (format!("删除失败: {err}"), true),
-                            }
-                        }
-                        Err(err) => (format!("删除已取消: {err}"), true),
-                    };
-                    let _ = tx.send(AppEvent::TaskDone {
-                        message,
-                        error,
-                        refresh: Refresh::Remote,
-                    });
+                self.spawn_remote_mutation(refs, "删除", move |client, refs| async move {
+                    let paths = refs
+                        .iter()
+                        .map(|reference| reference.path.clone())
+                        .collect::<Vec<_>>();
+                    match client.remove(&paths).await {
+                        Ok(()) => (format!("已删除 {count} 项"), false),
+                        Err(err) => (format!("删除失败: {err}"), true),
+                    }
                 });
                 self.marked_remote.clear();
             }
@@ -1548,6 +1428,8 @@ impl App {
                 | InputKind::Rename { .. }
                 | InputKind::MoveDest { .. }
                 | InputKind::CopyDest { .. }
+                | InputKind::SaveShareDest { .. }
+                | InputKind::SaveGroupDest { .. }
         )
     }
 
@@ -1738,23 +1620,12 @@ impl App {
                     self.set_status("新名称与原名称相同", true);
                     return;
                 }
-                let client = self.client.clone();
-                let tx = self.tx.clone();
-                let reference = from;
-                tokio::spawn(async move {
-                    let (message, error) =
-                        match verify_remote_refs(&client, std::slice::from_ref(&reference)).await {
-                            Ok(()) => match client.rename(&reference.path, &to).await {
-                                Ok(()) => (format!("已重命名: {} → {to}", reference.path), false),
-                                Err(err) => (format!("重命名失败: {err}"), true),
-                            },
-                            Err(err) => (format!("重命名已取消: {err}"), true),
-                        };
-                    let _ = tx.send(AppEvent::TaskDone {
-                        message,
-                        error,
-                        refresh: Refresh::Remote,
-                    });
+                self.spawn_remote_mutation(vec![from], "重命名", move |client, refs| async move {
+                    let from_path = &refs[0].path;
+                    match client.rename(from_path, &to).await {
+                        Ok(()) => (format!("已重命名: {from_path} → {to}"), false),
+                        Err(err) => (format!("重命名失败: {err}"), true),
+                    }
                 });
             }
             InputKind::MoveDest { sources } => {
@@ -1762,28 +1633,16 @@ impl App {
                     return;
                 }
                 let dest = normalize_remote(&value);
-                let client = self.client.clone();
-                let tx = self.tx.clone();
                 let count = sources.len();
-                tokio::spawn(async move {
-                    let (message, error) = match verify_remote_refs(&client, &sources).await {
-                        Ok(()) => {
-                            let paths = sources
-                                .iter()
-                                .map(|reference| reference.path.clone())
-                                .collect::<Vec<_>>();
-                            match client.move_paths(&paths, &dest).await {
-                                Ok(()) => (format!("已移动 {count} 项到 {dest}"), false),
-                                Err(err) => (format!("移动失败: {err}"), true),
-                            }
-                        }
-                        Err(err) => (format!("移动已取消: {err}"), true),
-                    };
-                    let _ = tx.send(AppEvent::TaskDone {
-                        message,
-                        error,
-                        refresh: Refresh::Remote,
-                    });
+                self.spawn_remote_mutation(sources, "移动", move |client, refs| async move {
+                    let paths = refs
+                        .iter()
+                        .map(|reference| reference.path.clone())
+                        .collect::<Vec<_>>();
+                    match client.move_paths(&paths, &dest).await {
+                        Ok(()) => (format!("已移动 {count} 项到 {dest}"), false),
+                        Err(err) => (format!("移动失败: {err}"), true),
+                    }
                 });
                 self.marked_remote.clear();
             }
@@ -1792,30 +1651,199 @@ impl App {
                     return;
                 }
                 let dest = normalize_remote(&value);
-                let client = self.client.clone();
-                let tx = self.tx.clone();
                 let count = sources.len();
-                tokio::spawn(async move {
-                    let (message, error) = match verify_remote_refs(&client, &sources).await {
-                        Ok(()) => {
-                            let paths = sources
-                                .iter()
-                                .map(|reference| reference.path.clone())
-                                .collect::<Vec<_>>();
-                            match client.copy_paths(&paths, &dest).await {
-                                Ok(()) => (format!("已复制 {count} 项到 {dest}"), false),
-                                Err(err) => (format!("复制失败: {err}"), true),
-                            }
-                        }
-                        Err(err) => (format!("复制已取消: {err}"), true),
-                    };
-                    let _ = tx.send(AppEvent::TaskDone {
-                        message,
-                        error,
-                        refresh: Refresh::Remote,
-                    });
+                self.spawn_remote_mutation(sources, "复制", move |client, refs| async move {
+                    let paths = refs
+                        .iter()
+                        .map(|reference| reference.path.clone())
+                        .collect::<Vec<_>>();
+                    match client.copy_paths(&paths, &dest).await {
+                        Ok(()) => (format!("已复制 {count} 项到 {dest}"), false),
+                        Err(err) => (format!("复制失败: {err}"), true),
+                    }
                 });
                 self.marked_remote.clear();
+            }
+            InputKind::OpenShare => {
+                if value.is_empty() {
+                    return;
+                }
+                match parse_share_input(&value) {
+                    Ok(input) => self.open_share_link(input),
+                    Err(err) => self.set_status(err.to_string(), true),
+                }
+            }
+            InputKind::SharePassword { mut input } => {
+                if value.is_empty() {
+                    self.set_status("提取码不能为空", true);
+                    return;
+                }
+                input.pwd = Some(value);
+                self.open_share_link(input);
+            }
+            InputKind::SaveShareDest {
+                session,
+                items,
+                download_after,
+            } => {
+                if value.is_empty() || items.is_empty() {
+                    return;
+                }
+                let dest = normalize_remote(&value);
+                let client = self.client.clone();
+                let tx = self.tx.clone();
+                let fs_ids: Vec<u64> = items.iter().map(|item| item.fs_id).collect();
+                let count = items.len();
+                self.marked_remote.clear();
+                self.set_status(
+                    if download_after {
+                        format!("正在转存 {count} 项到 {dest} 以准备下载…")
+                    } else {
+                        format!("正在转存 {count} 项到 {dest}…")
+                    },
+                    false,
+                );
+                tokio::spawn(async move {
+                    if let Err(err) = crate::transfer::upload::ensure_remote_dir(&client, &dest).await
+                    {
+                        let message = format!("创建目标目录失败: {err}");
+                        if download_after {
+                            let _ = tx.send(AppEvent::ExternalSavedForDownload {
+                                dest,
+                                items: Vec::new(),
+                                error: Some(message),
+                            });
+                        } else {
+                            let _ = tx.send(AppEvent::TaskDone {
+                                message,
+                                error: true,
+                                refresh: Refresh::None,
+                            });
+                        }
+                        return;
+                    }
+                    match transfer_share(&client, &session, &fs_ids, &dest).await {
+                        Ok(result) => {
+                            if download_after {
+                                let resolved =
+                                    resolve_saved_items(&client, &dest, &items, &result.saved_paths)
+                                        .await;
+                                let _ = tx.send(AppEvent::ExternalSavedForDownload {
+                                    dest,
+                                    items: resolved,
+                                    error: None,
+                                });
+                            } else {
+                                let _ = tx.send(AppEvent::TaskDone {
+                                    message: format!("已转存 {count} 项到 {dest}"),
+                                    error: false,
+                                    refresh: Refresh::None,
+                                });
+                            }
+                        }
+                        Err(err) => {
+                            let message = format!("转存分享文件失败: {err}");
+                            if download_after {
+                                let _ = tx.send(AppEvent::ExternalSavedForDownload {
+                                    dest,
+                                    items: Vec::new(),
+                                    error: Some(message),
+                                });
+                            } else {
+                                let _ = tx.send(AppEvent::TaskDone {
+                                    message,
+                                    error: true,
+                                    refresh: Refresh::None,
+                                });
+                            }
+                        }
+                    }
+                });
+            }
+            InputKind::SaveGroupDest {
+                gid,
+                batches,
+                items,
+                download_after,
+            } => {
+                if value.is_empty() || batches.is_empty() {
+                    return;
+                }
+                let dest = normalize_remote(&value);
+                let client = self.client.clone();
+                let tx = self.tx.clone();
+                let count = items.len();
+                self.marked_remote.clear();
+                self.set_status(
+                    if download_after {
+                        format!("正在转存群组 {count} 项到 {dest} 以准备下载…")
+                    } else {
+                        format!("正在转存群组 {count} 项到 {dest}…")
+                    },
+                    false,
+                );
+                tokio::spawn(async move {
+                    if let Err(err) = crate::transfer::upload::ensure_remote_dir(&client, &dest).await
+                    {
+                        let message = format!("创建目标目录失败: {err}");
+                        if download_after {
+                            let _ = tx.send(AppEvent::ExternalSavedForDownload {
+                                dest,
+                                items: Vec::new(),
+                                error: Some(message),
+                            });
+                        } else {
+                            let _ = tx.send(AppEvent::TaskDone {
+                                message,
+                                error: true,
+                                refresh: Refresh::None,
+                            });
+                        }
+                        return;
+                    }
+                    for batch in batches {
+                        if let Err(err) = transfer_group_files(
+                            &client,
+                            &gid,
+                            batch.from_uk,
+                            &batch.msg_id,
+                            &batch.fs_ids,
+                            &dest,
+                        )
+                        .await
+                        {
+                            let message = format!("转存群组文件失败: {err}");
+                            if download_after {
+                                let _ = tx.send(AppEvent::ExternalSavedForDownload {
+                                    dest,
+                                    items: Vec::new(),
+                                    error: Some(message),
+                                });
+                            } else {
+                                let _ = tx.send(AppEvent::TaskDone {
+                                    message,
+                                    error: true,
+                                    refresh: Refresh::None,
+                                });
+                            }
+                            return;
+                        }
+                    }
+                    if download_after {
+                        let resolved = resolve_saved_items(&client, &dest, &items, &[]).await;
+                        let _ = tx.send(AppEvent::ExternalSavedForDownload {
+                            dest,
+                            items: resolved,
+                            error: None,
+                        });
+                    } else {
+                        let _ = tx.send(AppEvent::TaskDone {
+                            message: format!("已转存 {count} 项群组文件到 {dest}"),
+                            error: false,
+                            refresh: Refresh::None,
+                        });
+                    }
+                });
             }
             InputKind::ExportConfig { redacted } => {
                 let path = if value.is_empty() {
@@ -2000,19 +2028,84 @@ impl App {
         ));
     }
 
+    fn start_open_share(&mut self) {
+        self.open_input(InputState::new(
+            "打开分享链接",
+            "粘贴分享链接（支持整段含提取码的分享文本）",
+            String::new(),
+            InputKind::OpenShare,
+        ));
+    }
+
+    fn start_save_external(&mut self, download_after: bool) {
+        let items = self.remote.marked_or_current(&self.marked_remote);
+        if items.is_empty() {
+            self.set_status("没有选中的项目", true);
+            return;
+        }
+        let default_dest = self.remote.cwd.clone();
+        match &self.remote.mode {
+            RemoteMode::Share(share) => {
+                let title = if download_after {
+                    "转存分享文件并下载"
+                } else {
+                    "转存分享文件到网盘"
+                };
+                self.open_input(InputState::new(
+                    title,
+                    format!("网盘目标目录（共 {} 项，Tab 补全）", items.len()),
+                    default_dest,
+                    InputKind::SaveShareDest {
+                        session: share.session.clone(),
+                        items,
+                        download_after,
+                    },
+                ));
+            }
+            RemoteMode::GroupShare(group) => {
+                let batches = build_group_batches(group, &items);
+                if batches.is_empty() {
+                    self.set_status("无法匹配所选群组文件的消息上下文，请刷新后重试", true);
+                    return;
+                }
+                let title = if download_after {
+                    "转存群组文件并下载"
+                } else {
+                    "转存群组文件到网盘"
+                };
+                self.open_input(InputState::new(
+                    title,
+                    format!("网盘目标目录（共 {} 项，Tab 补全）", items.len()),
+                    default_dest,
+                    InputKind::SaveGroupDest {
+                        gid: group.group.gid.clone(),
+                        batches,
+                        items,
+                        download_after,
+                    },
+                ));
+            }
+            _ => self.set_status("仅在分享或群组文件视图可用", true),
+        }
+    }
+
+    fn default_download_options(&self) -> DownloadOptions {
+        DownloadOptions {
+            overwrite: false,
+            rename_existing: true,
+            verify_md5: self.config.file.transfer.verify_md5,
+            connections: self.config.file.transfer.download_connections,
+            retries: self.config.file.transfer.retries,
+        }
+    }
+
     fn download_selected(&mut self) {
         let items = self.remote.marked_or_current(&self.marked_remote);
         if items.is_empty() {
             self.set_status("没有选中的远程项目", true);
             return;
         }
-        let options = DownloadOptions {
-            overwrite: false,
-            rename_existing: true,
-            verify_md5: self.config.file.transfer.verify_md5,
-            connections: self.config.file.transfer.download_connections,
-            retries: self.config.file.transfer.retries,
-        };
+        let options = self.default_download_options();
         let dest = self.local.cwd.clone();
         let cwd = self.remote.cwd.clone();
         let total = items.len();
@@ -2127,6 +2220,26 @@ impl App {
         }
     }
 
+    fn spawn_remote_mutation<F, Fut>(&self, refs: Vec<RemoteRef>, action_label: &'static str, op: F)
+    where
+        F: FnOnce(BaiduClient, Vec<RemoteRef>) -> Fut + Send + 'static,
+        Fut: std::future::Future<Output = (String, bool)> + Send,
+    {
+        let client = self.client.clone();
+        let tx = self.tx.clone();
+        tokio::spawn(async move {
+            let (message, error) = match verify_remote_refs(&client, &refs).await {
+                Ok(()) => op(client, refs).await,
+                Err(err) => (format!("{action_label}已取消: {err}"), true),
+            };
+            let _ = tx.send(AppEvent::TaskDone {
+                message,
+                error,
+                refresh: Refresh::Remote,
+            });
+        });
+    }
+
     fn cancel_selected_transfer(&mut self) {
         let Some(progress) = self.transfers.get(self.transfer_selected) else {
             return;
@@ -2140,6 +2253,71 @@ impl App {
             self.set_status(format!("已请求取消传输 #{}", id), false);
         } else {
             self.set_status("传输已结束或无法取消", true);
+        }
+    }
+
+    fn retry_selected_transfer(&mut self) {
+        let Some(progress) = self.transfers.get(self.transfer_selected).cloned() else {
+            return;
+        };
+        if !matches!(
+            progress.status,
+            TransferStatus::Failed | TransferStatus::Cancelled
+        ) {
+            self.set_status("仅可重试失败或已取消的传输任务", true);
+            return;
+        }
+        let Some(spec) = self.transfer_specs.get(&progress.id).cloned() else {
+            self.set_status("无法获取该任务的重试参数", true);
+            return;
+        };
+        let enqueued = match spec {
+            QueuedTaskKind::Download {
+                item,
+                cwd,
+                download_root,
+                options,
+            } => self.enqueue_download(item, cwd, download_root, options),
+            QueuedTaskKind::Upload {
+                local,
+                remote_dir,
+                options,
+            } => self.enqueue_upload(local, remote_dir, options),
+        };
+        if enqueued {
+            self.transfers.remove(self.transfer_selected);
+            self.transfer_specs.remove(&progress.id);
+            self.transfer_selected = self
+                .transfer_selected
+                .min(self.transfers.len().saturating_sub(1));
+            self.set_status(format!("已重新加入队列: {}", progress.name), false);
+        } else {
+            self.set_status("相同任务已在队列中", false);
+        }
+    }
+
+    fn clear_finished_transfers(&mut self) {
+        let before = self.transfers.len();
+        let mut removed_ids = Vec::new();
+        self.transfers.retain(|item| {
+            if item.status.is_terminal() {
+                removed_ids.push(item.id);
+                false
+            } else {
+                true
+            }
+        });
+        for id in removed_ids {
+            self.transfer_specs.remove(&id);
+        }
+        let removed = before - self.transfers.len();
+        self.transfer_selected = self
+            .transfer_selected
+            .min(self.transfers.len().saturating_sub(1));
+        if removed == 0 {
+            self.set_status("没有可清理的已结束传输任务", false);
+        } else {
+            self.set_status(format!("已清理 {removed} 个已结束传输任务"), false);
         }
     }
 
@@ -2198,10 +2376,45 @@ impl App {
                 let Some(item) = self.remote.current().cloned() else {
                     return;
                 };
-                if item.is_dir {
-                    self.navigate_remote(item.absolute_path(&self.remote.cwd));
-                } else {
-                    self.download_selected();
+                match self.remote.mode.clone() {
+                    RemoteMode::Browse | RemoteMode::Search { .. } => {
+                        if item.is_dir {
+                            self.navigate_remote(item.absolute_path(&self.remote.cwd));
+                        } else {
+                            self.download_selected();
+                        }
+                    }
+                    RemoteMode::Share(share) => {
+                        if item.is_dir {
+                            let next_dir = if item.path.starts_with('/') {
+                                normalize_remote(&item.path)
+                            } else {
+                                remote_join(&share.dir, &item.name)
+                            };
+                            self.load_share_dir(share.session, next_dir);
+                        } else {
+                            self.start_save_external(true);
+                        }
+                    }
+                    RemoteMode::GroupList(groups) => {
+                        if let Some(group) = groups
+                            .into_iter()
+                            .find(|g| g.gid == item.path)
+                        {
+                            self.load_group_shares(group);
+                        }
+                    }
+                    RemoteMode::GroupShare(group) => {
+                        if item.is_dir {
+                            if let Some(level) = next_group_dir_level(&group, &item) {
+                                self.load_group_dir(level);
+                            } else {
+                                self.set_status("无法解析该群组目录信息", true);
+                            }
+                        } else {
+                            self.start_save_external(true);
+                        }
+                    }
                 }
             }
             Focus::Transfers => self.cancel_selected_transfer(),
@@ -2240,16 +2453,48 @@ impl App {
                     self.navigate_local(parent);
                 }
             }
-            Focus::Remote => {
-                if matches!(self.remote.mode, RemoteMode::Search { .. }) {
+            Focus::Remote => match self.remote.mode.clone() {
+                RemoteMode::Search { .. } => {
                     self.clear_search();
-                    return;
                 }
-                if self.remote.cwd != "/" {
-                    let parent = remote_parent(&self.remote.cwd);
-                    self.navigate_remote(parent);
+                RemoteMode::Share(share) => {
+                    if share.dir != "/" {
+                        let parent = remote_parent(&share.dir);
+                        self.load_share_dir(share.session, parent);
+                    } else {
+                        self.exit_external_mode("已退出分享视图");
+                    }
                 }
-            }
+                RemoteMode::GroupList(_) => {
+                    self.exit_external_mode("已退出群组列表");
+                }
+                RemoteMode::GroupShare(mut group) => {
+                    if let Some(_popped) = group.path_stack.pop() {
+                        if let Some(parent) = group.path_stack.last().cloned() {
+                            self.remote.mode = RemoteMode::GroupShare(group);
+                            self.load_group_dir(parent);
+                        } else {
+                            self.remote.error = None;
+                            self.remote.entries =
+                                group.shares.iter().map(|entry| entry.item.clone()).collect();
+                            self.remote.mode = RemoteMode::GroupShare(group);
+                            self.remote.sort_entries();
+                            self.remote.selected = 0;
+                            self.remote.filter.clear();
+                            self.remote.clamp_selection();
+                            self.marked_remote.clear();
+                        }
+                    } else {
+                        self.load_groups();
+                    }
+                }
+                RemoteMode::Browse => {
+                    if self.remote.cwd != "/" {
+                        let parent = remote_parent(&self.remote.cwd);
+                        self.navigate_remote(parent);
+                    }
+                }
+            },
             Focus::Transfers => {}
         }
     }
@@ -2280,13 +2525,9 @@ impl App {
 
     fn clear_search(&mut self) {
         if matches!(self.remote.mode, RemoteMode::Search { .. }) {
-            let cwd = self.remote.cwd.clone();
-            self.remote.mode = RemoteMode::Browse;
-            self.remote.filter.clear();
-            self.remote.selected = 0;
-            self.remote.cwd = cwd;
-            self.load_remote();
-            self.set_status("已退出搜索结果", false);
+            self.exit_external_mode("已退出搜索结果");
+        } else if self.remote.is_read_only() {
+            self.exit_external_mode("已返回个人网盘");
         } else if !self.remote.filter.is_empty() {
             self.remote.filter.clear();
             self.remote.clamp_selection();
@@ -2294,6 +2535,17 @@ impl App {
             self.local.filter.clear();
             self.local.clamp_selection();
         }
+    }
+
+    fn exit_external_mode(&mut self, notice: &str) {
+        let cwd = self.remote.cwd.clone();
+        self.remote.mode = RemoteMode::Browse;
+        self.remote.filter.clear();
+        self.remote.selected = 0;
+        self.remote.cwd = cwd;
+        self.marked_remote.clear();
+        self.load_remote();
+        self.set_status(notice, false);
     }
 
     fn refresh_focused(&mut self) {
@@ -2310,7 +2562,137 @@ impl App {
         match self.remote.mode.clone() {
             RemoteMode::Browse => self.load_remote(),
             RemoteMode::Search { keyword, base } => self.load_search(keyword, base),
+            RemoteMode::Share(share) => self.load_share_dir(share.session, share.dir),
+            RemoteMode::GroupList(_) => self.load_groups(),
+            RemoteMode::GroupShare(group) => {
+                if let Some(level) = group.active_dir_context().cloned() {
+                    self.load_group_dir(level);
+                } else {
+                    self.load_group_shares(group.group);
+                }
+            }
         }
+    }
+
+    fn open_share_link(&mut self, input: ShareInput) {
+        self.remote.loading = true;
+        self.remote.error = None;
+        self.generation += 1;
+        let generation = self.generation;
+        let client = self.client.clone();
+        let tx = self.tx.clone();
+        self.set_status("正在解析分享链接…", false);
+        tokio::spawn(async move {
+            let result = open_share(&client, &input)
+                .await
+                .map_err(|err| err.to_string());
+            let _ = tx.send(AppEvent::ShareOpened {
+                generation,
+                input,
+                result,
+            });
+        });
+    }
+
+    fn load_share_dir(&mut self, session: ShareSession, dir: String) {
+        self.remote.loading = true;
+        self.remote.error = None;
+        self.generation += 1;
+        let generation = self.generation;
+        let client = self.client.clone();
+        let tx = self.tx.clone();
+        tokio::spawn(async move {
+            let result = list_share_dir(&client, &session, &dir).await;
+            let (items, error) = match result {
+                Ok(items) => (items, None),
+                Err(err) => (Vec::new(), Some(err.to_string())),
+            };
+            let _ = tx.send(AppEvent::ShareDirLoaded {
+                generation,
+                dir,
+                items,
+                error,
+            });
+        });
+    }
+
+    fn load_groups(&mut self) {
+        self.remote.loading = true;
+        self.remote.error = None;
+        self.generation += 1;
+        let generation = self.generation;
+        let client = self.client.clone();
+        let tx = self.tx.clone();
+        self.set_status("正在获取群组列表…", false);
+        tokio::spawn(async move {
+            let result = list_groups(&client).await;
+            let (groups, error) = match result {
+                Ok(groups) => (groups, None),
+                Err(err) => (Vec::new(), Some(err.to_string())),
+            };
+            let _ = tx.send(AppEvent::GroupListLoaded {
+                generation,
+                groups,
+                error,
+            });
+        });
+    }
+
+    fn load_group_shares(&mut self, group: GroupInfo) {
+        self.remote.loading = true;
+        self.remote.error = None;
+        self.generation += 1;
+        let generation = self.generation;
+        let client = self.client.clone();
+        let tx = self.tx.clone();
+        self.set_status(format!("正在读取群组 “{}” 文件…", group.name), false);
+        tokio::spawn(async move {
+            let result = list_group_shares(&client, &group.gid).await;
+            let (shares, error) = match result {
+                Ok(shares) => (shares, None),
+                Err(err) => (Vec::new(), Some(err.to_string())),
+            };
+            let _ = tx.send(AppEvent::GroupSharesLoaded {
+                generation,
+                group,
+                shares,
+                error,
+            });
+        });
+    }
+
+    fn load_group_dir(&mut self, level: GroupDirLevel) {
+        let gid = match &self.remote.mode {
+            RemoteMode::GroupShare(group) => group.group.gid.clone(),
+            _ => return,
+        };
+        self.remote.loading = true;
+        self.remote.error = None;
+        self.generation += 1;
+        let generation = self.generation;
+        let client = self.client.clone();
+        let tx = self.tx.clone();
+        tokio::spawn(async move {
+            let result = list_group_dir(
+                &client,
+                &gid,
+                level.from_uk,
+                &level.msg_id,
+                level.fs_id,
+                &level.dir,
+            )
+            .await;
+            let (items, error) = match result {
+                Ok(items) => (items, None),
+                Err(err) => (Vec::new(), Some(err.to_string())),
+            };
+            let _ = tx.send(AppEvent::GroupDirLoaded {
+                generation,
+                level,
+                items,
+                error,
+            });
+        });
     }
 
     fn load_remote(&mut self) {
@@ -2523,6 +2905,140 @@ fn common_prefix(values: &[&str]) -> String {
         }
     }
     prefix.into_iter().collect()
+}
+
+fn find_group_share<'a>(
+    shares: &'a [GroupShareEntry],
+    item: &RemoteItem,
+) -> Option<&'a GroupShareEntry> {
+    shares.iter().find(|entry| {
+        (item.fs_id != 0 && entry.item.fs_id == item.fs_id)
+            || (entry.item.path == item.path && entry.item.name == item.name)
+    })
+}
+
+fn next_group_dir_level(group: &GroupSessionState, item: &RemoteItem) -> Option<GroupDirLevel> {
+    if let Some(active) = group.active_dir_context() {
+        let dir = if item.path.starts_with('/') {
+            normalize_remote(&item.path)
+        } else {
+            remote_join(&active.dir, &item.name)
+        };
+        return Some(GroupDirLevel {
+            name: item.name.clone(),
+            dir,
+            msg_id: active.msg_id.clone(),
+            from_uk: active.from_uk,
+            fs_id: item.fs_id,
+        });
+    }
+    let entry = find_group_share(&group.shares, item)?;
+    let dir = if item.path.starts_with('/') {
+        normalize_remote(&item.path)
+    } else {
+        format!("/{}", item.name)
+    };
+    Some(GroupDirLevel {
+        name: item.name.clone(),
+        dir,
+        msg_id: entry.msg_id.clone(),
+        from_uk: entry.from_uk,
+        fs_id: item.fs_id,
+    })
+}
+
+fn build_group_batches(
+    group: &GroupSessionState,
+    items: &[RemoteItem],
+) -> Vec<GroupTransferBatch> {
+    if let Some(active) = group.active_dir_context() {
+        let fs_ids: Vec<u64> = items
+            .iter()
+            .filter(|item| item.fs_id != 0)
+            .map(|item| item.fs_id)
+            .collect();
+        if fs_ids.is_empty() {
+            return Vec::new();
+        }
+        return vec![GroupTransferBatch {
+            msg_id: active.msg_id.clone(),
+            from_uk: active.from_uk,
+            fs_ids,
+        }];
+    }
+    let mut grouped: HashMap<(String, u64), Vec<u64>> = HashMap::new();
+    for item in items {
+        if item.fs_id == 0 {
+            continue;
+        }
+        if let Some(entry) = find_group_share(&group.shares, item) {
+            grouped
+                .entry((entry.msg_id.clone(), entry.from_uk))
+                .or_default()
+                .push(item.fs_id);
+        }
+    }
+    let mut batches: Vec<GroupTransferBatch> = grouped
+        .into_iter()
+        .map(|((msg_id, from_uk), fs_ids)| GroupTransferBatch {
+            msg_id,
+            from_uk,
+            fs_ids,
+        })
+        .collect();
+    batches.sort_by(|a, b| a.msg_id.cmp(&b.msg_id).then_with(|| a.from_uk.cmp(&b.from_uk)));
+    batches
+}
+
+/// After transferring share/group items into `dest`, list `dest` (retrying briefly
+/// for async backend propagation) and match the newly saved `RemoteItem`s.
+async fn resolve_saved_items(
+    client: &BaiduClient,
+    dest: &str,
+    requested: &[RemoteItem],
+    saved_paths: &[String],
+) -> Vec<RemoteItem> {
+    for attempt in 0..3 {
+        if let Ok(entries) = client.list_dir(dest).await {
+            let mut matched = Vec::new();
+            if !saved_paths.is_empty() {
+                for path in saved_paths {
+                    let normalized = normalize_remote(path);
+                    if let Some(found) = entries
+                        .iter()
+                        .find(|entry| entry.absolute_path(dest) == normalized)
+                    {
+                        matched.push(found.clone());
+                    }
+                }
+            }
+            if matched.is_empty() {
+                for req in requested {
+                    let mut candidates: Vec<&RemoteItem> = entries
+                        .iter()
+                        .filter(|entry| {
+                            entry.name == req.name
+                                || entry.name.starts_with(&format!("{}(", req.name))
+                                || entry.name.starts_with(&format!("{} (", req.name))
+                        })
+                        .collect();
+                    candidates.sort_by_key(|a| std::cmp::Reverse(a.mtime));
+                    if let Some(best) = candidates.first() {
+                        if !matched.iter().any(|m: &RemoteItem| m.fs_id == best.fs_id) {
+                            matched.push((*best).clone());
+                        }
+                    }
+                }
+            }
+            if !matched.is_empty() {
+                return matched;
+            }
+        }
+        if attempt < 2 {
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        }
+    }
+    Vec::new()
 }
 
 fn step(current: usize, delta: isize, len: usize) -> usize {
@@ -3014,5 +3530,166 @@ mod tests {
             squashed.contains("关闭帮助"),
             "Missing close help prompt in rendered buffer:\n{rendered}"
         );
+    }
+
+    #[tokio::test]
+    async fn transfers_clear_and_retry_work() {
+        let (mut app, _dir) = test_app();
+        app.focus = Focus::Remote;
+        app.remote.entries = vec![remote_item()];
+        app.remote.selected = 0;
+        app.download_selected();
+
+        // Simulate transfer added and failed.
+        let id = 1;
+        app.handle_transfer(TransferEvent::Added(TransferProgress {
+            id,
+            direction: Direction::Download,
+            name: "file.txt".to_string(),
+            remote_path: "/docs/file.txt".to_string(),
+            local_path: app.local.cwd.join("file.txt"),
+            total: 10,
+            done: 0,
+            status: TransferStatus::Queued,
+            speed_bps: 0.0,
+            message: "排队".to_string(),
+            files_done: 0,
+            files_total: 1,
+        }));
+        app.handle_transfer(TransferEvent::Finished(TransferProgress {
+            id,
+            direction: Direction::Download,
+            name: "file.txt".to_string(),
+            remote_path: "/docs/file.txt".to_string(),
+            local_path: app.local.cwd.join("file.txt"),
+            total: 10,
+            done: 0,
+            status: TransferStatus::Failed,
+            speed_bps: 0.0,
+            message: "网络失败".to_string(),
+            files_done: 0,
+            files_total: 1,
+        }));
+
+        app.focus = Focus::Transfers;
+        app.transfer_selected = 0;
+        app.handle_key(KeyEvent::new(KeyCode::Char('R'), KeyModifiers::NONE));
+        assert_eq!(app.queue.tasks.len(), 1);
+        assert!(app.transfers.is_empty()); // Waiting for Added event from new spawn.
+
+        // Add a completed entry and verify `c` clears it.
+        app.handle_transfer(TransferEvent::Added(TransferProgress {
+            id: 2,
+            direction: Direction::Download,
+            name: "done.txt".to_string(),
+            remote_path: "/docs/done.txt".to_string(),
+            local_path: app.local.cwd.join("done.txt"),
+            total: 10,
+            done: 10,
+            status: TransferStatus::Completed,
+            speed_bps: 0.0,
+            message: "完成".to_string(),
+            files_done: 1,
+            files_total: 1,
+        }));
+        app.handle_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::NONE));
+        assert!(app.transfers.is_empty());
+    }
+
+    #[test]
+    fn external_share_and_group_modes_enforce_read_only_and_build_batches() {
+        let (mut app, _dir) = test_app();
+        app.focus = Focus::Remote;
+
+        // Open Share input via `S`
+        app.handle_key(KeyEvent::new(KeyCode::Char('S'), KeyModifiers::NONE));
+        assert!(matches!(
+            app.input.as_ref().map(|input| &input.kind),
+            Some(InputKind::OpenShare)
+        ));
+        app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+
+        // Enter Share mode and verify write shortcuts are blocked
+        let session = ShareSession {
+            shorturl: "1Test".to_string(),
+            verify_surl: "Test".to_string(),
+            shareid: 100,
+            uk: 200,
+            title: "测试分享".to_string(),
+            randsk: "rk".to_string(),
+            pwd: None,
+        };
+        app.remote.mode = RemoteMode::Share(ShareSessionState {
+            session,
+            dir: "/".to_string(),
+        });
+        app.remote.entries = vec![remote_item()];
+        app.remote.selected = 0;
+        assert!(app.remote.is_read_only());
+
+        for key in ['x', 'R', 'm', 'c', 'n', 'f'] {
+            app.handle_key(KeyEvent::new(KeyCode::Char(key), KeyModifiers::NONE));
+            assert!(app.confirm.is_none(), "{key} should be blocked in read-only mode");
+            assert!(app.input.is_none(), "{key} should be blocked in read-only mode");
+        }
+
+        // `t` opens SaveShareDest
+        app.handle_key(KeyEvent::new(KeyCode::Char('t'), KeyModifiers::NONE));
+        assert!(matches!(
+            app.input.as_ref().map(|input| &input.kind),
+            Some(InputKind::SaveShareDest { download_after: false, .. })
+        ));
+        app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+
+        // `d` opens SaveShareDest with download_after: true
+        app.handle_key(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::NONE));
+        assert!(matches!(
+            app.input.as_ref().map(|input| &input.kind),
+            Some(InputKind::SaveShareDest { download_after: true, .. })
+        ));
+        app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+
+        // Group batch grouping splits across distinct (msg_id, from_uk)
+        let item1 = RemoteItem {
+            fs_id: 11,
+            name: "a.txt".to_string(),
+            path: "/a.txt".to_string(),
+            ..Default::default()
+        };
+        let item2 = RemoteItem {
+            fs_id: 22,
+            name: "b.txt".to_string(),
+            path: "/b.txt".to_string(),
+            ..Default::default()
+        };
+        let group = GroupSessionState {
+            group: GroupInfo {
+                gid: "99".to_string(),
+                name: "测试群".to_string(),
+                member_count: 3,
+                status: 1,
+            },
+            shares: vec![
+                GroupShareEntry {
+                    msg_id: "m1".to_string(),
+                    from_uk: 10,
+                    ctime: 0,
+                    item: item1.clone(),
+                },
+                GroupShareEntry {
+                    msg_id: "m2".to_string(),
+                    from_uk: 20,
+                    ctime: 0,
+                    item: item2.clone(),
+                },
+            ],
+            path_stack: Vec::new(),
+        };
+        let batches = build_group_batches(&group, &[item1, item2]);
+        assert_eq!(batches.len(), 2);
+        assert_eq!(batches[0].msg_id, "m1");
+        assert_eq!(batches[0].fs_ids, vec![11]);
+        assert_eq!(batches[1].msg_id, "m2");
+        assert_eq!(batches[1].fs_ids, vec![22]);
     }
 }

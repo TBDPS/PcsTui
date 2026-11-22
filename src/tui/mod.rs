@@ -1,6 +1,8 @@
 pub mod app;
 pub(crate) mod config_panel;
 pub(crate) mod login;
+pub mod modal;
+pub mod panes;
 pub mod ui;
 
 use std::io::{Stdout, stdout};

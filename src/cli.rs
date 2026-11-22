@@ -114,6 +114,26 @@ pub enum Command {
     Cp { source: String, dest: String },
     /// 重命名远程文件或目录
     Rename { from: String, to: String },
+    /// 查看分享链接列表（只读诊断）
+    Share {
+        url: String,
+        #[arg(long)]
+        pwd: Option<String>,
+        #[arg(long)]
+        dir: Option<String>,
+    },
+    /// 列出群组或指定群组内的共享文件（只读诊断）
+    Group {
+        gid: Option<String>,
+        #[arg(long)]
+        msg_id: Option<String>,
+        #[arg(long)]
+        from_uk: Option<u64>,
+        #[arg(long)]
+        fs_id: Option<u64>,
+        #[arg(long, default_value = "/")]
+        dir: String,
+    },
     /// 诊断配置、权限、网络与 API
     Doctor,
     /// 登录并保存凭据（支持浏览器 Cookie；不实现密码/验证码登录）
@@ -221,6 +241,14 @@ pub async fn run(cli: Cli) -> Result<()> {
         Command::Mv { source, dest } => mv(config, &source, &dest).await,
         Command::Cp { source, dest } => cp(config, &source, &dest).await,
         Command::Rename { from, to } => rename(config, &from, &to).await,
+        Command::Share { url, pwd, dir } => share_ls(config, &url, pwd, dir).await,
+        Command::Group {
+            gid,
+            msg_id,
+            from_uk,
+            fs_id,
+            dir,
+        } => group_ls(config, gid, msg_id, from_uk, fs_id, &dir).await,
         Command::Doctor => doctor(config).await,
         Command::Login {
             from_config,
@@ -570,6 +598,110 @@ async fn rename(config: RuntimeConfig, from: &str, to: &str) -> Result<()> {
     let client = client(&config)?;
     client.rename(from, to).await?;
     println!("已重命名: {from} → {to}");
+    Ok(())
+}
+
+async fn share_ls(
+    config: RuntimeConfig,
+    url: &str,
+    pwd: Option<String>,
+    dir: Option<String>,
+) -> Result<()> {
+    let client = client(&config)?;
+    let mut input = crate::api::share::parse_share_input(url)?;
+    if let Some(pwd) = pwd.filter(|s| !s.trim().is_empty()) {
+        input.pwd = Some(pwd);
+    }
+    let (session, root_items) = crate::api::share::open_share(&client, &input).await?;
+    let items = if let Some(dir) = dir.filter(|d| d != "/") {
+        crate::api::share::list_share_dir(&client, &session, &dir).await?
+    } else {
+        root_items
+    };
+    println!(
+        "分享: {} (shareid={}, uk={}, {} 项)",
+        session.title,
+        session.shareid,
+        session.uk,
+        items.len()
+    );
+    for item in items {
+        let kind = if item.is_dir { "d" } else { "-" };
+        println!(
+            "{kind} {:>10}  {:>16}  {}",
+            if item.is_dir {
+                "-".to_string()
+            } else {
+                format_bytes(item.size)
+            },
+            item.fs_id,
+            item.name
+        );
+    }
+    Ok(())
+}
+
+async fn group_ls(
+    config: RuntimeConfig,
+    gid: Option<String>,
+    msg_id: Option<String>,
+    from_uk: Option<u64>,
+    fs_id: Option<u64>,
+    dir: &str,
+) -> Result<()> {
+    let client = client(&config)?;
+    match gid {
+        None => {
+            let groups = crate::api::group::list_groups(&client).await?;
+            println!("群组共 {} 个", groups.len());
+            for group in groups {
+                println!(
+                    "gid={}  {}  ({}人, status={})",
+                    group.gid, group.name, group.member_count, group.status
+                );
+            }
+        }
+        Some(gid) => {
+            if let (Some(msg_id), Some(from_uk), Some(fs_id)) = (msg_id, from_uk, fs_id) {
+                let items = crate::api::group::list_group_dir(
+                    &client, &gid, from_uk, &msg_id, fs_id, dir,
+                )
+                .await?;
+                println!("群组 {gid} 目录 (fs_id={fs_id}) 共 {} 项", items.len());
+                for item in items {
+                    let kind = if item.is_dir { "d" } else { "-" };
+                    println!(
+                        "{kind} {:>10}  fs_id={}  {}",
+                        if item.is_dir {
+                            "-".to_string()
+                        } else {
+                            format_bytes(item.size)
+                        },
+                        item.fs_id,
+                        item.name
+                    );
+                }
+                return Ok(());
+            }
+            let entries = crate::api::group::list_group_shares(&client, &gid).await?;
+            println!("群组 {gid} 共享共 {} 项", entries.len());
+            for entry in entries {
+                let kind = if entry.item.is_dir { "d" } else { "-" };
+                println!(
+                    "{kind} {:>10}  msg_id={}  from_uk={}  fs_id={}  {}",
+                    if entry.item.is_dir {
+                        "-".to_string()
+                    } else {
+                        format_bytes(entry.item.size)
+                    },
+                    entry.msg_id,
+                    entry.from_uk,
+                    entry.item.fs_id,
+                    entry.item.name
+                );
+            }
+        }
+    }
     Ok(())
 }
 

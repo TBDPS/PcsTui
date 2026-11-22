@@ -1,0 +1,12 @@
+[Desktop Entry]
+Version=1.0
+Type=Application
+Name=PcsTui
+GenericName=Baidu Netdisk TUI Client
+Comment=原生 Rust 百度网盘双栏终端客户端
+Exec=pcstui
+Icon=pcstui
+Terminal=true
+Categories=Network;FileTransfer;ConsoleOnly;
+Keywords=baidu;netdisk;pan;tui;pcstui;
+StartupNotify=false

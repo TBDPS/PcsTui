@@ -10,7 +10,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::api::models::{format_bytes, remote_join, remote_parent};
 use crate::api::{ApiError, BaiduClient};
-use crate::transfer::download::wait_for_retry;
+use crate::transfer::download::wait_for_retry_or_cancel;
 use crate::transfer::types::{ProgressReporter, TransferStatus, UploadOptions};
 
 pub const SLICE_MD5_SIZE: u64 = 256 * 1024;
@@ -112,6 +112,15 @@ pub fn block_size_for(size: u64, chunk_mib: u64) -> u64 {
 /// pass. Block MD5s are the block list used by `/api/precreate` and
 /// `/api/create`.
 pub fn hash_file(path: &Path, chunk_mib: u64) -> Result<FileHashes> {
+    hash_file_cancellable(path, chunk_mib, &CancellationToken::new())
+}
+
+/// Same as [`hash_file`], aborting promptly between reads when `cancel` is triggered.
+pub fn hash_file_cancellable(
+    path: &Path,
+    chunk_mib: u64,
+    cancel: &CancellationToken,
+) -> Result<FileHashes> {
     let mut file = File::open(path).with_context(|| format!("打开文件失败: {}", path.display()))?;
     let size = file.metadata()?.len();
     let block_size = block_size_for(size, chunk_mib);
@@ -123,6 +132,9 @@ pub fn hash_file(path: &Path, chunk_mib: u64) -> Result<FileHashes> {
     let mut buffer = vec![0_u8; block_size as usize];
 
     loop {
+        if cancel.is_cancelled() {
+            bail!("上传已取消");
+        }
         let mut filled = 0usize;
         while filled < buffer.len() {
             let read = file.read(&mut buffer[filled..])?;
@@ -258,9 +270,12 @@ pub async fn upload_one(
     reporter.set_status(TransferStatus::Hashing, "正在计算 MD5 / CRC32");
     let local = request.local.to_path_buf();
     let chunk_mib = options.chunk_mib;
-    let hashes = tokio::task::spawn_blocking(move || hash_file(&local, chunk_mib))
-        .await
-        .context("校验和任务失败")??;
+    let cancel_hash = cancel.clone();
+    let hashes = tokio::task::spawn_blocking(move || {
+        hash_file_cancellable(&local, chunk_mib, &cancel_hash)
+    })
+    .await
+    .context("校验和任务失败")??;
     if cancel.is_cancelled() {
         bail!("上传已取消");
     }
@@ -414,7 +429,9 @@ pub async fn upload_one(
                             options.retries
                         ),
                     );
-                    wait_for_retry(attempt).await;
+                    if !wait_for_retry_or_cancel(attempt, cancel).await {
+                        bail!("上传已取消");
+                    }
                     attempt += 1;
                     continue;
                 }
@@ -438,7 +455,9 @@ pub async fn upload_one(
                         options.retries
                     ),
                 );
-                wait_for_retry(attempt).await;
+                if !wait_for_retry_or_cancel(attempt, cancel).await {
+                    bail!("上传已取消");
+                }
                 attempt += 1;
                 continue;
             }
@@ -480,7 +499,7 @@ pub async fn upload_one(
         }
         return Err(anyhow!(describe_upload_error(&err)));
     }
-    verify_uploaded_content(client, &remote_path, &hashes.md5).await?;
+    verify_uploaded_content(client, &remote_path, &hashes.md5, cancel).await?;
     // Keep the completed block list until content verification passes, so a
     // retry can merge again without re-uploading every block.
     remove_state(&state_file);
@@ -496,9 +515,13 @@ async fn verify_uploaded_content(
     client: &BaiduClient,
     remote_path: &str,
     expected: &str,
+    cancel: &CancellationToken,
 ) -> Result<()> {
     let mut last = None;
     for attempt in 0..3 {
+        if cancel.is_cancelled() {
+            bail!("上传已取消");
+        }
         match client.content_md5(remote_path).await {
             Ok(Some(server)) if server == expected => return Ok(()),
             Ok(Some(server)) => last = Some(format!("服务器内容 MD5 {server}，本地 {expected}")),
@@ -506,7 +529,10 @@ async fn verify_uploaded_content(
             Err(err) => last = Some(err.to_string()),
         }
         if attempt < 2 {
-            tokio::time::sleep(std::time::Duration::from_millis(700)).await;
+            tokio::select! {
+                _ = cancel.cancelled() => bail!("上传已取消"),
+                _ = tokio::time::sleep(std::time::Duration::from_millis(700)) => {}
+            }
         }
     }
     if let Some(message) = last {
@@ -519,6 +545,17 @@ async fn verify_uploaded_content(
 
 pub async fn ensure_remote_dir(client: &BaiduClient, path: &str) -> Result<()> {
     let path = if path.trim().is_empty() { "/" } else { path };
+    if path == "/" {
+        return Ok(());
+    }
+    // Fast path: PCS `mkdir` succeeds in one round-trip when parents exist or
+    // the server creates them recursively. Fall back to prefix creation only
+    // when a parent is reported missing.
+    match client.ensure_dir(path).await {
+        Ok(()) => return Ok(()),
+        Err(err) if err.is_not_found() => {}
+        Err(err) => return Err(anyhow!(describe_upload_error(&err))),
+    }
     let mut current = String::new();
     for component in path.split('/').filter(|part| !part.is_empty()) {
         current.push('/');
